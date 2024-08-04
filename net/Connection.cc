@@ -6,12 +6,6 @@
 
 using namespace sll;
 
-// Connection::Connection(int socket, const sockaddr_in& address)
-//     :socket_(-1), address_(address),state_(eUnknown)
-// {
-//     socket_=  
-// }
-
 Connection::Connection(int port, EventLoop* loop) : socket_(-1), state_(eUnknown), loop_(loop)
 {
     StartScoket(int port);
@@ -97,7 +91,7 @@ void Connection::SetNonBlocking(int fd)
 
 void Connection::Send(const std::string& msg) {
     writeBuffer_ += msg;
-    HandleWrite(); // In a real reactor model, you should schedule this for later
+    //HandleWrite(); // In a real reactor model, you should schedule this for later
 }
 
 void Connection::close() {
@@ -131,6 +125,7 @@ int Connection::StartScoket(int port)
     loop_->AddEvent(socket_, EPOLL_EVENTS_R, [this](int fd, uint32_t events) {
         HandleAccept(fd, events);
     });
+    return 0;
 }
 
 int Connection::SetSockOpt(int fd)
