@@ -64,6 +64,7 @@ void Connection::HandleWrite(int fd, uint32_t events)
                 perror("HandleWrite");
                 return;
             }
+            break;
         }
         else if(n == 0) {
             perror("connection close");
