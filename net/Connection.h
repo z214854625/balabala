@@ -16,14 +16,13 @@ namespace sll {
 class Connection : public IConnection
 {
 public:
-  enum enConState {
-    eUnknown,
-    eConnected,
-    eDisconnected,
-    };
-    //Connection(int socket, const sockaddr_in& address);
     Connection(int port, EventLoop* loop);
     ~Connection();
+
+    //收到消息
+    virtual void OnRecv(RecvCallback&& );
+    //发送消息
+    virtual void Send(const char* pData, int nLen);
 
     void HandleRead(int fd, uint32_t events);
     void HandleWrite(int fd, uint32_t events);
@@ -32,21 +31,20 @@ public:
 
     static void SetNonBlocking(int fd);
 
-    void Send(onst std::string&);
-
     void Close();
 
 protected:
-    int StartScoket(const string& strIp, int port);
+    int Listen(int port);
 
     int SetSockOpt(int fd);
 
 private:
     int socket_;
     //sockaddr_in address_;
-    std::string writeBuffer_;
+    std::queue<std::string> sendMQ_;
     int state_;
     EventLoop* loop_;
+    RecvCallback recvCallback_;
 };
 
 } //namespace sll

@@ -31,6 +31,8 @@ public:
     void ModifyEvent(int fd, uint32_t events, Callback&& cb);
     //删除io事件
     void RemoveEvent(int fd);
+    //获取poller对象
+    const Poller* GetPoller() { return poller_.get(); };
 
 private:
     std::unique_ptr<Poller> poller_;

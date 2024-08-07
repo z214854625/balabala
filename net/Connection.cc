@@ -8,7 +8,7 @@ using namespace sll;
 
 Connection::Connection(int port, EventLoop* loop) : socket_(-1), state_(eUnknown), loop_(loop)
 {
-    StartScoket(int port);
+    Listen(int port);
 }
 
 Connection::~Connection()
@@ -22,20 +22,28 @@ void Connection::HandleRead(int fd, uint32_t events)
 {
     if ((events & EPOLLIN) == 0) {
         std::cout << "HandleRead events error." << events << ", fd= " << fd << std::endl;
-        return
+        return;
     }
     char buffer[BUFF_SIZE] = {0};
-    size_t n;
-    while ((n = read(fd, buffer, BUFF_SIZE)) > 0) {
-        std::cout << "Received: " << buffer << std::endl;
-        // Here you would typically process the data received
+    while (true) {
+        memset(buffer, 0, BUFF_SIZE);
+        int n = recv(fd, buffer, BUFF_SIZE, 0)
+        if (n < 0) {
+            if(errno != EINTR) {
+                std::cout << "read failed! errno= " << errno << ", fd= " << fd << std::endl;
+                return;
+            }
+            break;
+        }
+        else if (n == 0) {
+            std::cout << "socket disconnected! fd= " << fd << std::endl;
+            close(fd);
+            return;
+        }
+        //std::cout << "Received: " << buffer << std::endl;
+        recvCallback_(buffer, n);
     }
-    if (n == -1 && errno != EAGAIN) {
-        std::cout << "read failed! errno= " << errno << ", fd= " << fd << std::endl;
-    } else if (n == 0) {
-        std::cout << "socket disconnected! fd= " << fd << std::endl;
-        close(fd);
-    }
+    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_RW);
 }
 
 void Connection::HandleWrite(int fd, uint32_t events)
@@ -44,12 +52,31 @@ void Connection::HandleWrite(int fd, uint32_t events)
         std::cout << "HandleWrite events error." << events << ", fd= " << fd << std::endl;
         return;
     }
-    std::string msg = "Hello from server";
-    size_t n = write(fd, msg, msg.size());
-    if (n == -1) {
-        perror("write");
-        close(fd);
+    auto& msg = sendMQ_.front();
+    sendMQ_.pop();
+    int offset = 0;
+    int len = msg.size();
+    char* pData = msg.data();
+    while (len > 0) {
+        int n = write(fd, pData + offset, len);
+        if (n == -1) {
+            if(errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN) {
+                perror("HandleWrite");
+                return;
+            }
+        }
+        else if(n == 0) {
+            perror("connection close");
+            close(fd);
+            return;
+        }
+        else {
+            offset += n;
+            len -= n;
+        }
     }
+    //设置读状态
+    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_RW);
 }
 
 void Connection::HandleAccept(int listenFd, uint32_t events)
@@ -83,27 +110,33 @@ void Connection::HandleClose()
     socket_ = -1;
 }
 
+void Connection::OnRecv(RecvCallback&& callback)
+{
+    recvCallback_ = std::forward<RecvCallback>(callback);
+}
+
+void Connection::Send(const char* pData, int nLen)
+{
+    sendMQ_.push(std::string(pData, nLen));
+}
+
 void Connection::SetNonBlocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void Connection::Send(const std::string& msg) {
-    writeBuffer_ += msg;
-    //HandleWrite(); // In a real reactor model, you should schedule this for later
-}
-
-void Connection::close() {
+void Connection::close()
+{
     HandleClose();
 }
 
-int Connection::StartScoket(int port)
+int Connection::Listen(int port)
 {
     socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_ == -1) {
         perror("socket");
-        return 1;
+        return -1;
     }
     Connection::SetNonBlocking(socket_);
     SetSockOpt(socket_);
@@ -115,12 +148,12 @@ int Connection::StartScoket(int port)
     if (bind(socket_, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
         perror("bind");
         close(socket_);
-        return 1;
+        return -1;
     }
     if (listen(socket_, 5) == -1) {
         perror("listen");
         close(socket_);
-        return 1;
+        return -1;
     }
     loop_->AddEvent(socket_, EPOLL_EVENTS_R, [this](int fd, uint32_t events) {
         HandleAccept(fd, events);
