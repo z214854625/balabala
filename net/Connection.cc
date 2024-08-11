@@ -144,7 +144,7 @@ int Connection::Listen(int port)
         return -1;
     }
     Connection::SetNonBlocking(socket_);
-    SetSockOpt(socket_);
+    Connection::SetSockOpt(socket_);
 
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;

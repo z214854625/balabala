@@ -26,6 +26,11 @@ public:
     virtual void Send(const char* pData, int nLen) = 0;
     //客户端连接成功回调
     virtual void OnConnected(ConnCallback&& callback) = 0;
+    //读事件处理
+    virtual void HandleRead(int fd, uint32_t events) = 0;
+    //写事件处理
+    virtual void HandleWrite(int fd, uint32_t events) = 0;
+
 };
 
 } //namespace sll

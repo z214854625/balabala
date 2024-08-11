@@ -15,7 +15,7 @@ class EventLoop;
 class Connector : public IConnection
 {
 public:
-    Connector(EventLoop* loop, int port, const std::string& strIP);
+    Connector(EventLoop* loop, int port, const std::string& strIp);
     ~Connector();
 
     //收到消息
@@ -24,6 +24,13 @@ public:
     virtual void Send(const char* pData, int nLen);
     //客户端连接成功回调
     virtual void OnConnected(ConnCallback&& callback);
+    //读事件处理
+    virtual void HandleRead(int fd, uint32_t events);
+    //写事件处理
+    virtual void HandleWrite(int fd, uint32_t events);
+
+protected:
+    int _Connect(int port, const std::string& strIp);
 
 private:
     int socket_;

@@ -27,19 +27,18 @@ public:
     //客户端连接成功回调
     virtual void OnConnected(ConnCallback&& callback) {}
 
-    void HandleRead(int fd, uint32_t events);
-    void HandleWrite(int fd, uint32_t events);
+    virtual void HandleRead(int fd, uint32_t events);
+    virtual void HandleWrite(int fd, uint32_t events);
     void HandleAccept(int listenFd, uint32_t events);
     void HandleClose();
 
     static void SetNonBlocking(int fd);
+    static int SetSockOpt(int fd);
 
     void Close();
 
 protected:
     int Listen(int port);
-
-    int SetSockOpt(int fd);
 
 private:
     int socket_;

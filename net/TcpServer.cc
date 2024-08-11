@@ -11,8 +11,8 @@ void TcpServer::Start()
     //conn_ = std::make_unique<Connection>(port, &loop_);
     conn_.reset(new Connection(port, &loop_));
     conn_->OnRecv([this](const char* pData, int nLen) {
-        //recv msg
-        std::cout << "recv msg: " << pData << std::endl;
-        //conn_->Send(string(pData, nLen));
+        std::cout << "server recv msg: " << pData << std::endl;
+        conn_->Send(pData, nLen);
     });
+    std::cout << "TcpServer::Start suc!" << std::endl;
 }
