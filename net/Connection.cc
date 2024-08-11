@@ -1,14 +1,19 @@
-#include <netinet/in.h>
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include "precompiled.h"
 #include "Connection.h"
 #include "EventLoop.h"
 
 using namespace sll;
+using namespace std;
 
-Connection::Connection(int port, EventLoop* loop) : socket_(-1), state_(eUnknown), loop_(loop)
+Connection::Connection(int port, EventLoop* loop) : socket_(-1), state_(0), loop_(loop)
 {
-    Listen(int port);
+    Listen(port);
 }
 
 Connection::~Connection()
@@ -27,15 +32,14 @@ void Connection::HandleRead(int fd, uint32_t events)
     char buffer[BUFF_SIZE] = {0};
     while (true) {
         memset(buffer, 0, BUFF_SIZE);
-        int n = recv(fd, buffer, BUFF_SIZE, 0)
+        int n = recv(fd, buffer, BUFF_SIZE, 0);
         if (n < 0) {
             if(errno != EINTR) {
                 std::cout << "read failed! errno= " << errno << ", fd= " << fd << std::endl;
                 return;
             }
             break;
-        }
-        else if (n == 0) {
+        } else if (n == 0) {
             std::cout << "socket disconnected! fd= " << fd << std::endl;
             close(fd);
             return;
@@ -48,7 +52,7 @@ void Connection::HandleRead(int fd, uint32_t events)
 
 void Connection::HandleWrite(int fd, uint32_t events)
 {
-    if (events & EPOLLOUT == 0) {
+    if ((events & EPOLLOUT) == 0) {
         std::cout << "HandleWrite events error." << events << ", fd= " << fd << std::endl;
         return;
     }
@@ -56,7 +60,7 @@ void Connection::HandleWrite(int fd, uint32_t events)
     sendMQ_.pop();
     int offset = 0;
     int len = msg.size();
-    char* pData = msg.data();
+    const char* pData = msg.data();
     while (len > 0) {
         int n = write(fd, pData + offset, len);
         if (n == -1) {
@@ -82,8 +86,8 @@ void Connection::HandleWrite(int fd, uint32_t events)
 
 void Connection::HandleAccept(int listenFd, uint32_t events)
 {
-    if (events & EPOLLIN == 0) {
-        std::cout << "HandleAccept events error." << events << ", fd= " << fd << std::endl;
+    if ((events & EPOLLIN) == 0) {
+        std::cout << "HandleAccept events error." << events << ", fd= " << listenFd << std::endl;
         return;
     }
     sockaddr_in addr;
@@ -127,7 +131,7 @@ void Connection::SetNonBlocking(int fd)
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void Connection::close()
+void Connection::Close()
 {
     HandleClose();
 }

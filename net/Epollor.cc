@@ -1,19 +1,23 @@
 #include "Epollor.h"
 
 using namespace sll;
+using namespace std;
 
-Epollor::Epollor(int maxEvents) : maxEvents_(maxEvents), events_(maxEvents) {
+Epollor::Epollor(int maxEvents) : maxEvents_(maxEvents), events_(maxEvents)
+{
     epollFd_ = epoll_create1(0);
     if (epollFd_ == -1) {
         throw std::runtime_error("Failed to create epoll file descriptor");
     }
 }
 
-Epollor::~Epollor() {
+Epollor::~Epollor()
+{
     close(epollFd_);
 }
 
-void Epollor::AddEvent(int fd, uint32_t events) {
+void Epollor::AddEvent(int fd, uint32_t events)
+{
     epoll_event event{};
     event.events = events;
     event.data.fd = fd;
@@ -22,7 +26,8 @@ void Epollor::AddEvent(int fd, uint32_t events) {
     }
 }
 
-void Epollor::ModifyEvent(int fd, uint32_t events) {
+void Epollor::ModifyEvent(int fd, uint32_t events)
+{
     epoll_event event{};
     event.events = events;
     event.data.fd = fd;
@@ -31,12 +36,14 @@ void Epollor::ModifyEvent(int fd, uint32_t events) {
     }
 }
 
-void Epollor::RemoveEvent(int fd) {
+void Epollor::RemoveEvent(int fd)
+{
     if (epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr) == -1) {
         throw std::runtime_error("Failed to remove file descriptor from epoll");
     }
 }
 
-void Epollor::Wait(int timeout) {
+int Epollor::Wait(int timeout)
+{
     return epoll_wait(epollFd_, events_.data(), maxEvents_, timeout);
 }

@@ -11,16 +11,21 @@
 
 namespace sll {
 
+class IConnection;
+
 using RecvCallback = std::function<void(const char* pData, int nLen)>;
+using ConnCallback = std::function<void(IConnection*)>;
 
 class IConnection
 {
 public:
     virtual ~IConnection(){}
     //收到消息
-    virtual void OnRecv(RecvCallback&&) = 0;
+    virtual void OnRecv(RecvCallback&& callback) = 0;
     //发送消息
     virtual void Send(const char* pData, int nLen) = 0;
+    //客户端连接成功回调
+    virtual void OnConnected(ConnCallback&& callback) = 0;
 };
 
 } //namespace sll

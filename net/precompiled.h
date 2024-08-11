@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <functional>
 #include <unistd.h>
+#include <cstring>
 #include <stdexcept>
 #include <condition_variable>
 #include <thread>

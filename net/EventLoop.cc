@@ -1,7 +1,10 @@
 #include "EventLoop.h"
 #include "Epollor.h"
 
-EventLoop::EventLoop() : poller_(nullptr), looping_(false), stop_(false)
+using namespace sll;
+using namespace std;
+
+EventLoop::EventLoop() : looping_(false), stop_(false)
 {
 }
 
@@ -18,7 +21,9 @@ EventLoop::~EventLoop()
 
 void EventLoop::Create(int threadSize)
 {
-    poller_ = std::make_unique<Epollor>(1024);
+    //poller_ = std::make_unique<Epollor>(1024);
+    poller_.reset(new Epollor(1024));
+
     if (poller_ == nullptr) {
         throw std::runtime_error("Failed to create epoll file descriptor");
     }
@@ -30,16 +35,16 @@ void EventLoop::Create(int threadSize)
 void EventLoop::run(int timeout)
 {
     while (!stop_) {
-        int ready = poller_.Wait(timeout);
+        int ready = poller_->Wait(timeout);
         if (ready < 0) {
             if (errno == EINTR) { // Interrupted by signal
-                std::cout << "epoll interrupted by signal." << std::endl
-                return ;
+                std::cout << "epoll interrupted by signal." << std::endl;
+                return;
             }
             throw std::runtime_error("Error in epoll_wait");
         }
         const auto& firedEvents = poller_->GetFiredEvents();
-        for (int i = 0; i < firedEvents.size(); ++i) {
+        for (size_t i = 0; i < firedEvents.size(); ++i) {
             std::lock_guard<std::mutex> lock(mtx_); //对 callbacks_ 加锁
             int fd = firedEvents[i].data.fd;
             uint32_t events = firedEvents[i].events;
@@ -76,7 +81,7 @@ void EventLoop::AddEvent(int fd, uint32_t events, Callback&& cb)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     if(poller_) {
-        poller_.AddEvent(fd, events, cb);
+        poller_->AddEvent(fd, events);
     }
     callbacks_[fd] = std::forward<Callback>(cb);
 }
@@ -85,7 +90,7 @@ void EventLoop::ModifyEvent(int fd, uint32_t events, Callback&& cb)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     if(poller_) {
-        poller_.ModifyEvent(fd, events, cb);
+        poller_->ModifyEvent(fd, events);
     }
     callbacks_[fd] = std::forward<Callback>(cb);
 }
@@ -94,7 +99,7 @@ void EventLoop::RemoveEvent(int fd)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     if(poller_) {
-        poller_.RemoveEvent(fd);
+        poller_->RemoveEvent(fd);
     }
     callbacks_.erase(fd);
 }
