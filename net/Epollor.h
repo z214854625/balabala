@@ -5,7 +5,7 @@
 @brief: epoll类封装
 */
 
-#include "precompiled.h"
+#include <vector>
 #include "Poller.h"
 
 namespace sll {

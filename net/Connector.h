@@ -5,7 +5,6 @@
 @brief: 客户端connection对象，连接服务器socket
 */
 
-#include "precompiled.h"
 #include "IConnection.h"
 #include "../Util/SpinLockQueue.h"
 

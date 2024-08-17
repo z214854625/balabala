@@ -5,7 +5,6 @@
 @brief: 服务端Connection对象，处理epoll回调事件
 */
 
-#include "precompiled.h"
 #include "IConnection.h"
 #include "Poller.h"
 #include "../Util/SpinLockQueue.h"

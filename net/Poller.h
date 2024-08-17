@@ -5,7 +5,7 @@
 @brief: Poller基类
 */
 
-#include "precompiled.h"
+#include <vector>
 #include <sys/epoll.h>
 
 // LT模式：epoll默认的工作模式，数据没处理完每次都会收到提醒，ET模式：epoll只会对事件提醒一次
