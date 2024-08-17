@@ -23,6 +23,21 @@ Connection::~Connection()
     }
 }
 
+void Connection::OnRecv(RecvCallback&& callback)
+{
+    recvCallback_ = std::forward<RecvCallback>(callback);
+}
+
+void Connection::Send(const char* pData, int nLen)
+{
+    if (socket_ < 0) {
+        perror("Connection Send socket_ < 0");
+        return;
+    }
+    sendMQ_.push(std::string(pData, nLen));
+    loop_->GetPoller()->ModifyEvent(socket_, EPOLL_EVENTS_W);
+}
+
 void Connection::HandleRead(int fd, uint32_t events)
 {
     char buffer[NET_BUFF_SIZE] = {0};
@@ -41,6 +56,7 @@ void Connection::HandleRead(int fd, uint32_t events)
             break;
         } else if (n == 0) {
             std::cout << "Connection close! fd=" << socket_ << std::endl;
+            disConnCallback_(this);
             close(fd);
             return;
         }
@@ -82,6 +98,7 @@ void Connection::HandleWrite(int fd, uint32_t events)
             }
             else if(n == 0) {
                 std::cout << "Connection close! fd=" << fd << std::endl;
+                disConnCallback_(this);
                 close(fd);
                 return;
             }
@@ -121,36 +138,15 @@ void Connection::HandleAccept(int listenFd, uint32_t events)
     });
 }
 
-void Connection::HandleClose()
+void Connection::OnDisconnected(DisConnCallback&& callback)
 {
-    close(socket_);
-    socket_ = -1;
-}
-
-void Connection::OnRecv(RecvCallback&& callback)
-{
-    recvCallback_ = std::forward<RecvCallback>(callback);
-}
-
-void Connection::Send(const char* pData, int nLen)
-{
-    if (socket_ < 0) {
-        perror("Connection Send socket_ < 0");
-        return;
-    }
-    sendMQ_.push(std::string(pData, nLen));
-    loop_->GetPoller()->ModifyEvent(socket_, EPOLL_EVENTS_W);
+    disConnCallback_ = std::forward<DisConnCallback>(callback);
 }
 
 void Connection::SetNonBlocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-void Connection::Close()
-{
-    HandleClose();
 }
 
 void Connection::_Listen(int port)

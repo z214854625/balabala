@@ -19,6 +19,9 @@ Connector::Connector(EventLoop* loop, int port, const std::string& strIp)
 
 Connector::~Connector()
 {
+    if (socket_ != -1) {
+        close(socket_);
+    }
 }
 
 void Connector::OnRecv(RecvCallback&& callback)
@@ -60,6 +63,7 @@ void Connector::HandleRead(int fd, uint32_t events)
             break;
         } else if (n == 0) {
             std::cout << "Connector close! fd=" << socket_ << std::endl;
+            disConnCallback_(this);
             close(fd);
             return;
         }
@@ -102,6 +106,7 @@ void Connector::HandleWrite(int fd, uint32_t events)
             }
             else if(n == 0) {
                 std::cout << "Connector close! fd=" << fd << std::endl;
+                disConnCallback_(this);
                 close(fd);
                 return;
             }
@@ -114,6 +119,11 @@ void Connector::HandleWrite(int fd, uint32_t events)
     } while (false);
     //设置读状态
     loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_R);
+}
+
+void Connector::OnDisconnected(DisConnCallback&& callback)
+{
+    disConnCallback_ = std::forward<DisConnCallback>(callback);
 }
 
 void Connector::_Connect(int port, const std::string& strIp)

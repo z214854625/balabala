@@ -26,16 +26,17 @@ public:
     virtual void Send(const char* pData, int nLen);
     //客户端连接成功回调
     virtual void OnConnected(ConnCallback&& callback) {}
-
+    //读事件处理
     virtual void HandleRead(int fd, uint32_t events);
+    //写事件处理
     virtual void HandleWrite(int fd, uint32_t events);
+    //断开连接
+    virtual void OnDisconnected(DisConnCallback&& callback);
+
     void HandleAccept(int listenFd, uint32_t events);
-    void HandleClose();
 
     static void SetNonBlocking(int fd);
     static int SetSockOpt(int fd);
-
-    void Close();
 
 protected:
     void _Listen(int port);
@@ -46,6 +47,7 @@ private:
     int state_;
     EventLoop* loop_;
     RecvCallback recvCallback_;
+    DisConnCallback disConnCallback_;
 };
 
 } //namespace sll

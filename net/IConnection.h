@@ -15,6 +15,7 @@ class IConnection;
 
 using RecvCallback = std::function<void(const char* pData, int nLen)>;
 using ConnCallback = std::function<void(IConnection*)>;
+using DisConnCallback = std::function<void(IConnection*)>;
 
 class IConnection
 {
@@ -30,6 +31,8 @@ public:
     virtual void HandleRead(int fd, uint32_t events) = 0;
     //写事件处理
     virtual void HandleWrite(int fd, uint32_t events) = 0;
+    //断开连接
+    virtual void OnDisconnected(DisConnCallback&& callback) = 0;
 
 };
 

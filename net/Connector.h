@@ -29,6 +29,8 @@ public:
     virtual void HandleRead(int fd, uint32_t events);
     //写事件处理
     virtual void HandleWrite(int fd, uint32_t events);
+    //断开连接
+    virtual void OnDisconnected(DisConnCallback&& callback);
 
 protected:
     void _Connect(int port, const std::string& strIp);
@@ -40,6 +42,7 @@ private:
     EventLoop* loop_;
     RecvCallback recvCallback_;
     ConnCallback connCallback_;
+    DisConnCallback disConnCallback_;
     int port_;
     std::string strIp_;
 };

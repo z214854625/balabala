@@ -17,6 +17,10 @@ void TcpClient::Start(int port, const std::string strIp)
     conn_->OnRecv([this](const char* pData, int nLen) {
         std::cout << "recv msg: len= " <<nLen << ", data= " << pData << std::endl;
     });
+    //断开连接
+    conn_->OnDisconnected([this](IConnection* pSvrConn) {
+        std::cout << "pSvrConn disconnected! " << std::endl;
+    });
     //读取一行信息
     while(1) {
         // 清理缓冲区以准备读取整行输入
