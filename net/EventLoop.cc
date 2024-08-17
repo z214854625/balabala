@@ -111,7 +111,7 @@ void EventLoop::OnDispatch(int timeout)
             (*task)();
         }
         int64_t tick2 = GetMilliSeconds();
-        if (timeout > 0 && ((tick2 - tick1) > (timeout*1000))){
+        if (timeout > 0 && ((tick2 - tick1) > timeout)){
             return;
         }
     }

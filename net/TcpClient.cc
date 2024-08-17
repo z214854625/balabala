@@ -23,7 +23,7 @@ void TcpClient::Start(int port, const std::string strIp)
     });
     auto t1 = std::thread([this](){
         while (1) {
-            loop_.OnDispatch(1);
+            loop_.OnDispatch(500);
             usleep(25000);
         }
     });

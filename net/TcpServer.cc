@@ -19,7 +19,7 @@ void TcpServer::Start(int port)
         std::cout << "pClientConn disconnected! " << std::endl;
     });
     while (1) {
-        loop_.OnDispatch(1);
+        loop_.OnDispatch(500);
         usleep(25000);
     }
 }
