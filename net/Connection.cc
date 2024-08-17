@@ -123,7 +123,7 @@ void Connection::HandleAccept(int listenFd, uint32_t events)
     socklen_t addrLen = sizeof(addr);
     int clientFd = ::accept(listenFd, (sockaddr*)&addr, &addrLen);
     if (clientFd == -1) {
-        perror("accept clientFd -1");
+        std::cout << "HandleAccept accept failed! fd= " << listenFd << ", errno=" << errno << std::endl;
         return;
     }
     SetNonBlocking(clientFd);

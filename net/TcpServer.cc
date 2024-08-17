@@ -18,4 +18,8 @@ void TcpServer::Start(int port)
     conn_->OnDisconnected([this](IConnection* pClientConn) {
         std::cout << "pClientConn disconnected! " << std::endl;
     });
+    while (1) {
+        loop_.OnDispatch(1);
+        usleep(25000);
+    }
 }

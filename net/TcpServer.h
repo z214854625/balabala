@@ -16,6 +16,8 @@ class TcpServer
 public:
     void Start(int port);
 
+    void OnDispatch();
+
 private:
     std::unique_ptr<IConnection> conn_;
     EventLoop loop_;

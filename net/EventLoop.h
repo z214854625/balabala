@@ -6,6 +6,7 @@
 */
 
 #include "precompiled.h"
+#include "../Util/SpinLockQueue.h"
 
 namespace sll {
 
@@ -33,14 +34,16 @@ public:
     void RemoveEvent(int fd);
     //获取poller对象
     Poller* GetPoller() { return poller_.get(); };
-
+    //派发任务
+    void OnDispatch(int timeout = 0);
+    //获取系统毫秒
+    int64_t GetMilliSeconds();
 private:
     std::unique_ptr<Poller> poller_;
     bool stop_;
     std::vector<std::thread> threadPool_;
-    std::queue<std::function<void()>> taskQueue_;
-    std::condition_variable cv_;
-    std::mutex mtx_;
+    sll::SpinLockQueue<std::function<void()>> taskQueue_;
+    sll::SpinLock spinLock_;
     std::unordered_map<int, Callback> callbacks_;
 };
 

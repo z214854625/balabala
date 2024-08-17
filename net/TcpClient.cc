@@ -21,6 +21,12 @@ void TcpClient::Start(int port, const std::string strIp)
     conn_->OnDisconnected([this](IConnection* pSvrConn) {
         std::cout << "pSvrConn disconnected! " << std::endl;
     });
+    auto t1 = std::thread([this](){
+        while (1) {
+            loop_.OnDispatch(1);
+            usleep(25000);
+        }
+    });
     //读取一行信息
     while(1) {
         // 清理缓冲区以准备读取整行输入
@@ -30,4 +36,5 @@ void TcpClient::Start(int port, const std::string strIp)
         conn_->Send(msg.c_str(), msg.length());
         std::cout << "send msg: " << msg << std::endl;
     }
+    t1.join();
 }
