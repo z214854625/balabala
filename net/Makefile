@@ -1,7 +1,7 @@
 .PHONY: all clean
 
 G = g++
-CFLAGS = -Wall -g -m64 -fPIC -shared -std=c++20 -include precompiled.h
+CFLAGS = -Wall -g -m64 -fPIC -std=c++20 -include precompiled.h
 
 INCLUDE = -I./
 

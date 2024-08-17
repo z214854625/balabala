@@ -14,7 +14,7 @@ namespace sll {
 class TcpClient
 {
 public:
-    void Start();
+    void Start(int port, const std::string strIp);
 
 private:
     std::unique_ptr<IConnection> conn_;

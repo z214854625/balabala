@@ -13,7 +13,7 @@
 #define EPOLL_EVENTS_R (EPOLLET | EPOLLIN)
 #define EPOLL_EVENTS_W (EPOLLET | EPOLLOUT)
 
-#define BUFF_SIZE 64*1024
+#define NET_BUFF_SIZE 64*1024
 
 namespace sll {
 

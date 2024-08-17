@@ -4,22 +4,26 @@
 using namespace sll;
 using namespace std;
 
-void TcpClient::Start()
+void TcpClient::Start(int port, const std::string strIp)
 {
-    loop_.Create(8);
-    int port = 9527;
-    std::string strIp = "127.0.0.1";
+    std::cout << "TcpClient::Start 1--" << std::endl;
+    loop_.Create(4);
     conn_.reset(new Connector(&loop_, port, strIp));
     //连接成功
     conn_->OnConnected([this](IConnection* pConn){
         std::cout << "connect suc!" << std::endl;
     });
-    //发送消息
-    std::string msg = "hellp world!";
-    conn_->Send(msg.c_str(), msg.length());
     //收到消息
     conn_->OnRecv([this](const char* pData, int nLen) {
-        std::cout << "client recv msg: " << pData << std::endl;
+        std::cout << "recv msg: len= " <<nLen << ", data= " << pData << std::endl;
     });
-    std::cout << "TcpClient::Start suc!" << std::endl;
+    //读取一行信息
+    while(1) {
+        // 清理缓冲区以准备读取整行输入
+        std::cout << "enter msg: " << std::endl;
+        std::string msg;
+        std::getline(std::cin, msg);
+        conn_->Send(msg.c_str(), msg.length());
+        std::cout << "send msg: " << msg << std::endl;
+    }
 }

@@ -13,7 +13,7 @@ using namespace std;
 
 Connection::Connection(int port, EventLoop* loop) : socket_(-1), state_(0), loop_(loop)
 {
-    Listen(port);
+    _Listen(port);
 }
 
 Connection::~Connection()
@@ -25,63 +25,75 @@ Connection::~Connection()
 
 void Connection::HandleRead(int fd, uint32_t events)
 {
-    if ((events & EPOLLIN) == 0) {
-        std::cout << "HandleRead events error." << events << ", fd= " << fd << std::endl;
-        return;
-    }
-    char buffer[BUFF_SIZE] = {0};
+    char buffer[NET_BUFF_SIZE] = {0};
     while (true) {
-        memset(buffer, 0, BUFF_SIZE);
-        int n = recv(fd, buffer, BUFF_SIZE, 0);
+        memset(buffer, 0, NET_BUFF_SIZE);
+        int n = recv(fd, buffer, NET_BUFF_SIZE, 0);
         if (n < 0) {
-            if(errno != EINTR) {
-                std::cout << "read failed! errno= " << errno << ", fd= " << fd << std::endl;
+            if (errno == EINTR) { //被信号中断，继续读取
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) { //数据读取完毕，退出循环
+                break;
+            } else {
+                std::cout << "Connection read failed! fd= " << fd << ", errno= " << errno << std::endl;
                 return;
             }
             break;
         } else if (n == 0) {
-            std::cout << "socket disconnected! fd= " << fd << std::endl;
+            std::cout << "Connection close! fd=" << socket_ << std::endl;
             close(fd);
             return;
         }
         //std::cout << "Received: " << buffer << std::endl;
         recvCallback_(buffer, n);
     }
-    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_RW);
+    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_W);
 }
 
 void Connection::HandleWrite(int fd, uint32_t events)
 {
-    if ((events & EPOLLOUT) == 0) {
-        std::cout << "HandleWrite events error." << events << ", fd= " << fd << std::endl;
-        return;
-    }
-    auto& msg = sendMQ_.front();
-    sendMQ_.pop();
-    int offset = 0;
-    int len = msg.size();
-    const char* pData = msg.data();
-    while (len > 0) {
-        int n = write(fd, pData + offset, len);
-        if (n == -1) {
-            if(errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN) {
-                perror("HandleWrite");
-                return;
-            }
+    do
+    {
+        //std::cout << "Connection::HandleWrite call. fd= " << fd << ", mq size="<< sendMQ_.size() << std::endl;
+        if (sendMQ_.empty()){
             break;
         }
-        else if(n == 0) {
-            perror("connection close");
-            close(fd);
-            return;
+        auto msg = sendMQ_.pop();
+        if (!msg){
+            //std::cout << "Connection::HandleWrite sendMQ_ pop failed. fd= " << fd << ", mq size="<< sendMQ_.size() << std::endl;
+            break;
         }
-        else {
-            offset += n;
-            len -= n;
+        int offset = 0;
+        size_t len = (*msg).size();
+        const char* pData = (*msg).data();
+        while (len > 0) {
+            int n = write(fd, pData + offset, len);
+            //std::cout << "Connection::HandleWrite write fd= " << fd << ", n="<< n << ", errno=" << errno << std::endl;
+            if (n < 0) {
+                if (errno == EINTR) { //被信号中断，继续读取
+                    continue;
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) { //数据写入完毕，退出循环
+                    break;
+                } else {
+                    std::cout << "Connection write failed! fd= " << fd << ", errno= " << errno << std::endl;
+                    return;
+                }
+                break;
+            }
+            else if(n == 0) {
+                std::cout << "Connection close! fd=" << fd << std::endl;
+                close(fd);
+                return;
+            }
+            else {
+                offset += n;
+                len -= n;
+            }
         }
-    }
+
+    } while (false);
     //设置读状态
-    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_RW);
+    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_R);
 }
 
 void Connection::HandleAccept(int listenFd, uint32_t events)
@@ -122,7 +134,12 @@ void Connection::OnRecv(RecvCallback&& callback)
 
 void Connection::Send(const char* pData, int nLen)
 {
+    if (socket_ < 0) {
+        perror("Connection Send socket_ < 0");
+        return;
+    }
     sendMQ_.push(std::string(pData, nLen));
+    loop_->GetPoller()->ModifyEvent(socket_, EPOLL_EVENTS_W);
 }
 
 void Connection::SetNonBlocking(int fd)
@@ -136,100 +153,53 @@ void Connection::Close()
     HandleClose();
 }
 
-int Connection::Listen(int port)
+void Connection::_Listen(int port)
 {
     socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_ == -1) {
-        perror("socket");
-        return -1;
+        throw std::runtime_error("Connection create socket failed! errno=" + to_string(errno));
     }
     Connection::SetNonBlocking(socket_);
-    Connection::SetSockOpt(socket_);
 
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port = htons(port);
     if (bind(socket_, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
-        perror("bind");
         close(socket_);
-        return -1;
+        throw std::runtime_error("Connection bind failed! errno=" + to_string(errno));
     }
     if (listen(socket_, 5) == -1) {
-        perror("listen");
         close(socket_);
-        return -1;
+        throw std::runtime_error("Connection listen failed! errno=" + to_string(errno));
     }
     loop_->AddEvent(socket_, EPOLL_EVENTS_R, [this](int fd, uint32_t events) {
         HandleAccept(fd, events);
     });
-    return 0;
+    std::cout << "listen suc! port= " << port << std::endl;
 }
 
 int Connection::SetSockOpt(int fd)
 {
-    int flags =1;
     int keepalive = 1;
-    struct linger ling = {0, 0};
-
     int error = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(keepalive));
     if (error != 0) {
         return -1;
     }
+    int flags = 1;
     error = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
     if (error != 0) {
         return -1;
     }
+    struct linger ling = {0, 0};
     error = setsockopt(fd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
     if (error != 0){
         return -1;
     }
+    flags = 1;
     error = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
     if (error != 0) {
         return -1;
     }
     return 0;
 }
-
-/*
-int main() {
-    int listenFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenFd == -1) {
-        perror("socket");
-        return 1;
-    }
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(12345);
-
-    if (bind(listenFd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
-        perror("bind");
-        close(listenFd);
-        return 1;
-    }
-
-    if (listen(listenFd, 5) == -1) {
-        perror("listen");
-        close(listenFd);
-        return 1;
-    }
-
-    EpollWrapper::setNonBlocking(listenFd);
-
-    try {
-        EpollWrapper epoll(10, 4);
-        epoll.addFd(listenFd, EPOLLIN | EPOLLET, 
-                    [&](int fd, uint32_t events) { handleAccept(fd, events, epoll); });
-
-        epoll.run();
-    } catch (const std::exception &e) {
-        std::cerr << "Exception: " << e.what() << std::endl;
-    }
-
-    close(listenFd);
-    return 0;
-}
-
-*/

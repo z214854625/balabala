@@ -1,3 +1,3 @@
 #!/bin/sh
 
-./net -s
+./net -s 9527

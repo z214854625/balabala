@@ -7,6 +7,7 @@
 
 #include "precompiled.h"
 #include "IConnection.h"
+#include "../Util/SpinLockQueue.h"
 
 namespace sll {
 
@@ -30,16 +31,17 @@ public:
     virtual void HandleWrite(int fd, uint32_t events);
 
 protected:
-    int _Connect(int port, const std::string& strIp);
+    void _Connect(int port, const std::string& strIp);
 
 private:
     int socket_;
-    //sockaddr_in address_;
-    std::queue<std::string> sendMQ_;
+    sll::SpinLockQueue<std::string> sendMQ_;
     int state_;
     EventLoop* loop_;
     RecvCallback recvCallback_;
     ConnCallback connCallback_;
+    int port_;
+    std::string strIp_;
 };
 
 } //namespace sll

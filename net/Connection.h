@@ -8,7 +8,7 @@
 #include "precompiled.h"
 #include "IConnection.h"
 #include "Poller.h"
-
+#include "../Util/SpinLockQueue.h"
 
 namespace sll {
 
@@ -38,12 +38,11 @@ public:
     void Close();
 
 protected:
-    int Listen(int port);
+    void _Listen(int port);
 
 private:
     int socket_;
-    //sockaddr_in address_;
-    std::queue<std::string> sendMQ_;
+    sll::SpinLockQueue<std::string> sendMQ_;
     int state_;
     EventLoop* loop_;
     RecvCallback recvCallback_;

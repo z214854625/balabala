@@ -36,7 +36,6 @@ public:
 
 private:
     std::unique_ptr<Poller> poller_;
-    bool looping_;
     bool stop_;
     std::vector<std::thread> threadPool_;
     std::queue<std::function<void()>> taskQueue_;

@@ -14,7 +14,7 @@ namespace sll {
 class TcpServer
 {
 public:
-    void Start();
+    void Start(int port);
 
 private:
     std::unique_ptr<IConnection> conn_;
