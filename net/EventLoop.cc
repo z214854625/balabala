@@ -27,8 +27,37 @@ void EventLoop::Create(int threadSize)
     if (poller_ == nullptr) {
         throw std::runtime_error("Failed to create epoll file descriptor");
     }
+    //队列任务线程
+    for (int i = 0; i < threadSize; i++) {
+        threadPool_.emplace_back(std::thread(&EventLoop::WorkerThread, this));
+    }
     //loop线程
     threadPool_.emplace_back(std::thread(&EventLoop::run, this, 25));
+}
+
+void EventLoop::WorkerThread()
+{
+    std::cout << "EventLoop::WorkerThread 1--" << std::endl;
+    while (true) {
+        if(stop_){
+            while(!taskQueue_.empty()) {
+                auto task = taskQueue_.pop();
+                if (task) {
+                    (*task)();
+                }
+            }
+            return;
+        }
+        if (taskQueue_.empty()){
+            usleep(25000);
+            continue;
+        }
+        auto task = taskQueue_.pop();
+        if (task) {
+            (*task)();
+        }
+    }
+    std::cout << "EventLoop::WorkerThread end!" << std::endl;
 }
 
 void EventLoop::run(int timeout)
@@ -103,12 +132,20 @@ void EventLoop::OnDispatch(int timeout)
     //std::cout << "EventLoop::OnDispatch timeout= " << timeout << std::endl;
     int64_t tick1 = GetMilliSeconds();
     while (true) {
-        if (taskQueue_.empty()){
+        if (msgQueue_.empty()){
             return;
         }
-        auto task = taskQueue_.pop();
-        if (task) {
-            (*task)();
+        auto p = msgQueue_.pop();
+        if (p) {
+            auto fd = std::get<0>(*p);
+            auto& msg = std::get<1>(*p);
+            auto& callback = std::get<2>(*p);
+            auto pConn = this->GetConnection(fd);
+            if (!pConn) {
+                std::cout << "EventLoop::OnDispatch pConn null, fd=" << fd << ", msg_size=" << msg.size() << std::endl;
+                continue;
+            }
+            callback(pConn, msg.c_str(), msg.size());
         }
         int64_t tick2 = GetMilliSeconds();
         if (timeout > 0 && ((tick2 - tick1) > timeout)){
@@ -121,4 +158,34 @@ int64_t EventLoop::GetMilliSeconds(){
     auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
     auto val = now_ms.time_since_epoch().count();
     return val;
+}
+
+void EventLoop::AddMsg(recvMsgType&& p)
+{
+    msgQueue_.push(std::forward<recvMsgType>(p));
+}
+
+void EventLoop::AddConnection(IConnection* pConn)
+{
+    mapConn_.insert({pConn->GetFd(), pConn});
+    std::cout << "AddConnection fd=" << pConn->GetFd() << std::endl;
+}
+
+IConnection* EventLoop::GetConnection(int fd)
+{
+    auto it = mapConn_.find(fd);
+    if (it == mapConn_.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+void EventLoop::RemoveConnection(int fd)
+{
+    auto it = mapConn_.find(fd);
+    if (it != mapConn_.end()) {
+        delete it->second;
+        mapConn_.erase(it);
+        std::cout << "RemoveConnection fd=" << fd << std::endl;
+    }
 }

@@ -10,16 +10,17 @@ void TcpClient::Start(int port, const std::string strIp)
     loop_.Create(4);
     conn_.reset(new Connector(&loop_, port, strIp));
     //连接成功
-    conn_->OnConnected([this](IConnection* pConn){
+    conn_->OnConnected([&](IConnection* pSvrConn){
         std::cout << "connect suc!" << std::endl;
-    });
-    //收到消息
-    conn_->OnRecv([this](const char* pData, int nLen) {
-        std::cout << "recv msg: len= " <<nLen << ", data= " << pData << std::endl;
-    });
-    //断开连接
-    conn_->OnDisconnected([this](IConnection* pSvrConn) {
-        std::cout << "pSvrConn disconnected! " << std::endl;
+        //收到消息
+        conn_->OnRecv([&](IConnection* pConn, const char* pData, int nLen) {
+            std::cout << "cli recv msg! len= " << nLen << ", data= " << "" << ", fd=" << pConn->GetFd() << std::endl;
+            pConn->Send(pData, nLen);
+        });
+        //断开连接
+        conn_->OnDisconnected([&](IConnection* pConn) {
+            std::cout << "server disconnected! fd=" << pConn->GetFd() << std::endl;
+        });
     });
     auto t1 = std::thread([this](){
         while (1) {

@@ -13,7 +13,7 @@ namespace sll {
 
 class IConnection;
 
-using RecvCallback = std::function<void(const char* pData, int nLen)>;
+using RecvCallback = std::function<void(IConnection*, const char* pData, int nLen)>;
 using ConnCallback = std::function<void(IConnection*)>;
 using DisConnCallback = std::function<void(IConnection*)>;
 
@@ -33,7 +33,10 @@ public:
     virtual void HandleWrite(int fd, uint32_t events) = 0;
     //断开连接
     virtual void OnDisconnected(DisConnCallback&& callback) = 0;
-
+    //accept事件处理
+    virtual void HandleAccept(int listenFd, uint32_t events) = 0;
+    //getfd
+    virtual int GetFd() = 0;
 };
 
 } //namespace sll

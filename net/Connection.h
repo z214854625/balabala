@@ -2,21 +2,20 @@
 /**
 @auther: chencaiyu
 @date: 2024.8.1
-@brief: 服务端Connection对象，处理epoll回调事件
+@brief: 服务端收到客户端连接的对象，处理epoll回调事件
 */
 
-#include "IConnection.h"
-#include "Poller.h"
+#include "ConnectionBase.h"
 #include "../Util/SpinLockQueue.h"
 
 namespace sll {
 
 class EventLoop;
 
-class Connection : public IConnection
+class Connection : public ConnectionBase
 {
 public:
-    Connection(int port, EventLoop* loop);
+    Connection(int fd, EventLoop* loop);
     ~Connection();
 
     //收到消息
@@ -31,22 +30,12 @@ public:
     virtual void HandleWrite(int fd, uint32_t events);
     //断开连接
     virtual void OnDisconnected(DisConnCallback&& callback);
-
-    void HandleAccept(int listenFd, uint32_t events);
-
-    static void SetNonBlocking(int fd);
-    static int SetSockOpt(int fd);
-
-protected:
-    void _Listen(int port);
+    //accept事件处理
+    virtual void HandleAccept(int listenFd, uint32_t events) {}
+    //getfd
+    virtual int GetFd() { return socket_; }
 
 private:
-    int socket_;
-    sll::SpinLockQueue<std::string> sendMQ_;
-    int state_;
-    EventLoop* loop_;
-    RecvCallback recvCallback_;
-    DisConnCallback disConnCallback_;
 };
 
 } //namespace sll

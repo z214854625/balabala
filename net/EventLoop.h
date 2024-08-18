@@ -7,6 +7,7 @@
 
 #include "precompiled.h"
 #include "../Util/SpinLockQueue.h"
+#include "IConnection.h"
 
 namespace sll {
 
@@ -17,6 +18,7 @@ class EventLoop
 public:
     using Functor = std::function<void()>;
     using Callback = std::function<void(int, uint32_t)>;
+    using recvMsgType = std::tuple<int, std::string, RecvCallback>;
 
     EventLoop();
     ~EventLoop();
@@ -38,13 +40,23 @@ public:
     void OnDispatch(int timeout = 0);
     //获取系统毫秒
     int64_t GetMilliSeconds();
+    //加入消息队列
+    void AddMsg(recvMsgType&& p);
+    //加入连接对象列表
+    void AddConnection(sll::IConnection* pConn);
+    //获取连接对象列表
+    sll::IConnection* GetConnection(int fd);
+    //删除连接对象
+    void RemoveConnection(int fd);
 private:
     std::unique_ptr<Poller> poller_;
     bool stop_;
     std::vector<std::thread> threadPool_;
     sll::SpinLockQueue<std::function<void()>> taskQueue_;
+    sll::SpinLockQueue<recvMsgType> msgQueue_;
     sll::SpinLock spinLock_;
     std::unordered_map<int, Callback> callbacks_;
+    std::unordered_map<int, sll::IConnection*> mapConn_; //连接对象
 };
 
 } //namespace sll
