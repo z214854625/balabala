@@ -84,8 +84,14 @@ void Acceptor::_Listen(int port)
         close(socket_);
         throw std::runtime_error("Acceptor listen failed! errno=" + to_string(errno));
     }
+    loop_->AddConnection(this); //添加到连接列表
     loop_->AddEvent(socket_, EPOLL_EVENTS_R, [this](int fd, uint32_t events) {
-        HandleAccept(fd, events);
+        auto pAccept = loop_->GetConnection(fd);
+        if (pAccept == nullptr) {
+            std::cout << "Acceptor::_Listen pAccept null. fd=" << fd << ", event=" << events << std::endl;
+            return;
+        }
+        pAccept->HandleAccept(fd, events);
     });
     std::cout << "listen suc! port= " << port << std::endl;
 }

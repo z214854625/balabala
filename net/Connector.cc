@@ -81,11 +81,16 @@ void Connector::_Connect(int port, const std::string& strIp)
         }
     }
     loop_->AddEvent(socket_, EPOLL_EVENTS_RW, [this](int fd, uint32_t event) {
+        auto pConn = loop_->GetConnection(fd);
+        if (pConn == nullptr) {
+            std::cout << "Connector::_Connect pConn null. fd=" << fd << ", event=" << event << std::endl;
+            return;
+        }
         if (event & EPOLLIN){
-            HandleRead(fd, event);
+            pConn->HandleRead(fd, event);
         }
         if (event & EPOLLOUT){
-            HandleWrite(fd, event);
+            pConn->HandleWrite(fd, event);
         }
     });
     //添加到管理列表中
