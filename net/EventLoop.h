@@ -9,7 +9,7 @@
 #include "../Util/SpinLockQueue.h"
 #include "IConnection.h"
 
-namespace sll {
+namespace bllsll {
 
 class Poller;
 
@@ -43,20 +43,20 @@ public:
     //加入消息队列
     void AddMsg(recvMsgType&& p);
     //加入连接对象列表
-    void AddConnection(sll::IConnection* pConn);
+    void AddConnection(bllsll::IConnection* pConn);
     //获取连接对象列表
-    sll::IConnection* GetConnection(int fd);
+    bllsll::IConnection* GetConnection(int fd);
     //删除连接对象
     void RemoveConnection(int fd);
 private:
     std::unique_ptr<Poller> poller_;
     bool stop_;
     std::vector<std::thread> threadPool_;
-    sll::SpinLockQueue<std::function<void()>> taskQueue_;
-    sll::SpinLockQueue<recvMsgType> msgQueue_;
-    sll::SpinLock spinLock_;
+    bllsll::SpinLockQueue<std::function<void()>> taskQueue_;
+    bllsll::SpinLockQueue<recvMsgType> msgQueue_;
+    bllsll::SpinLock spinLock_;
     std::unordered_map<int, Callback> callbacks_;
-    std::unordered_map<int, sll::IConnection*> mapConn_; //连接对象
+    std::unordered_map<int, bllsll::IConnection*> mapConn_; //连接对象
 };
 
-} //namespace sll
+} //namespace bllsll

@@ -7,7 +7,7 @@
 @brief: LockGuard 实现
 */
 
-namespace sll {
+namespace bllsll {
 
 template <typename Lock>
 class LockGuard {
@@ -29,4 +29,4 @@ private:
 };
 
 
-} //namespace sll
+} //namespace bllsll

@@ -15,7 +15,7 @@
 
 #define NET_BUFF_SIZE 64*1024
 
-namespace sll {
+namespace bllsll {
 
 class Poller
 {
@@ -33,4 +33,4 @@ public:
     virtual const std::vector<epoll_event>& GetFiredEvents() = 0;
 };
 
-} // namespace sll
+} // namespace bllsll

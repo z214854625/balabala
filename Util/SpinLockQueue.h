@@ -10,7 +10,7 @@
 #include <optional>
 #include "SpinLock.h"
 
-namespace sll {
+namespace bllsll {
 
 template <class T>
 class SpinLockQueue
@@ -52,8 +52,8 @@ public:
     }
 
 private:
-    mutable sll::SpinLock lock; // 使用自旋锁保护队列访问
+    mutable bllsll::SpinLock lock; // 使用自旋锁保护队列访问
     std::queue<T> queue;
 };
 
-} //namespace sll
+} //namespace bllsll

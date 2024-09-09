@@ -3,7 +3,7 @@
 #include "TcpServer.h"
 #include "TcpClient.h"
 
-using namespace sll;
+using namespace bllsll;
 using namespace std;
 
 int main(int argc, char *argv[])
@@ -30,8 +30,8 @@ int main(int argc, char *argv[])
         }
     }
     std::cout << "net start! connect_flag= " << connect_flag << std::endl;
-    sll::TcpServer tcpSvr;
-    sll::TcpClient tcpCli;
+    bllsll::TcpServer tcpSvr;
+    bllsll::TcpClient tcpCli;
     if (connect_flag == 1) {
         tcpSvr.Start(port);
     }else if(connect_flag == 2){

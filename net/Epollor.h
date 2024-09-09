@@ -8,7 +8,7 @@
 #include <vector>
 #include "Poller.h"
 
-namespace sll {
+namespace bllsll {
 
 class Epollor : public Poller
 {
@@ -35,4 +35,4 @@ private:
     std::vector<epoll_event> events_;
 };
 
-} //namespace sll
+} //namespace bllsll

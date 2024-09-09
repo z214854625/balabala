@@ -9,7 +9,7 @@
 #include <functional>
 #include <string>
 
-namespace sll {
+namespace bllsll {
 
 class IConnection;
 
@@ -39,4 +39,4 @@ public:
     virtual int GetFd() = 0;
 };
 
-} //namespace sll
+} //namespace bllsll

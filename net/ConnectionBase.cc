@@ -5,7 +5,7 @@
 #include "EventLoop.h"
 #include "Poller.h"
 
-using namespace sll;
+using namespace bllsll;
 using namespace std;
 
 ConnectionBase::ConnectionBase(EventLoop* loop) : socket_(-1), state_(0), lastMsgCache_(""), loop_(loop)

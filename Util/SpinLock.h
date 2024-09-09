@@ -7,7 +7,7 @@
 @brief: 自旋锁
 */
 
-namespace sll {
+namespace bllsll {
 
 class SpinLock
 {
@@ -32,4 +32,4 @@ private:
     std::atomic_flag flag;
 };
 
-} //namespace sll
+} //namespace bllsll

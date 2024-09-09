@@ -5,7 +5,7 @@
 @brief: IO帮助类
 */
 
-namespace sll {
+namespace bllsll {
 
 class IOHelper
 {
@@ -17,4 +17,4 @@ public:
     static int SetSockOpt(int fd);
 };
 
-} //namespace sll
+} //namespace bllsll

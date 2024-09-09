@@ -8,7 +8,7 @@
 #include "ConnectionBase.h"
 #include "../Util/SpinLockQueue.h"
 
-namespace sll {
+namespace bllsll {
 
 class EventLoop;
 
@@ -38,4 +38,4 @@ public:
 private:
 };
 
-} //namespace sll
+} //namespace bllsll

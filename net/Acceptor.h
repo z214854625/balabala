@@ -9,7 +9,7 @@
 #include "Poller.h"
 #include "../Util/SpinLockQueue.h"
 
-namespace sll {
+namespace bllsll {
 
 class EventLoop;
 
@@ -45,4 +45,4 @@ private:
     ConnCallback connCallback_;
 };
 
-} //namespace sll
+} //namespace bllsll

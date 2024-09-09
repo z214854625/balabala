@@ -2,7 +2,7 @@
 #include "Epollor.h"
 #include "../Util/LockGuard.h"
 
-using namespace sll;
+using namespace bllsll;
 using namespace std;
 
 EventLoop::EventLoop() : stop_(false)
@@ -82,7 +82,7 @@ void EventLoop::run(int timeout)
         for (int i = 0; i < len; ++i) {
             int fd = firedEvents[i].data.fd;
             uint32_t events = firedEvents[i].events;
-            sll::LockGuard<sll::SpinLock> lock(spinLock_); //对callbacks_上锁
+            bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_); //对callbacks_上锁
             auto it = callbacks_.find(fd);
             //std::cout << "EventLoop::run fd= " << fd << ", event= " << events << ", find= " << (it != callbacks_.end()) << std::endl;
             if (it != callbacks_.end()) {
@@ -102,7 +102,7 @@ void EventLoop::AddEvent(int fd, uint32_t events, Callback&& cb)
     if(poller_) {
         poller_->AddEvent(fd, events);
     }
-    sll::LockGuard<sll::SpinLock> lock(spinLock_);
+    bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_);
     callbacks_[fd] = std::forward<Callback>(cb);
     //std::cout << "EventLoop::AddEvent " << fd << std::endl;
 }
@@ -112,7 +112,7 @@ void EventLoop::ModifyEvent(int fd, uint32_t events, Callback&& cb)
     if(poller_) {
         poller_->ModifyEvent(fd, events);
     }
-    sll::LockGuard<sll::SpinLock> lock(spinLock_);
+    bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_);
     callbacks_[fd] = std::forward<Callback>(cb);
     //std::cout << "EventLoop::ModifyEvent " << fd << std::endl;
 }
@@ -122,7 +122,7 @@ void EventLoop::RemoveEvent(int fd)
     if(poller_) {
         poller_->RemoveEvent(fd);
     }
-    sll::LockGuard<sll::SpinLock> lock(spinLock_);
+    bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_);
     callbacks_.erase(fd);
     //std::cout << "EventLoop::RemoveEvent " << fd << std::endl;
 }

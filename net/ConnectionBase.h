@@ -8,7 +8,7 @@
 #include "IConnection.h"
 #include "../Util/SpinLockQueue.h"
 
-namespace sll {
+namespace bllsll {
 
 class EventLoop;
 
@@ -38,11 +38,11 @@ public:
 protected:
     int socket_;
     int state_;
-    sll::SpinLockQueue<std::string> sendMQ_;
+    bllsll::SpinLockQueue<std::string> sendMQ_;
     std::string lastMsgCache_;
     EventLoop* loop_;
     RecvCallback recvCallback_;
     DisConnCallback disConnCallback_;
 };
 
-} //namespace sll
+} //namespace bllsll
