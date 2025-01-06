@@ -36,16 +36,17 @@ bool AppLauncher::StartApp(int argc, char* argv[])
         std::cout << "Failed to load library: " << dlerror() << std::endl;
         return false;
     }
-    typedef void* (*CreateAppFunc)(); // 定义函数类型用于获取派生对象
-    CreateAppFunc func = (CreateAppFunc)dlsym(_handle, "CreateAppFunction");
-    if (!func) {
+    // 清除之前的错误
+    dlerror();
+    // 定义函数类型用于获取派生对象
+    typedef IApplication* (*CreateAppFunc)();
+    CreateAppFunc create = (CreateAppFunc)dlsym(_handle, "CreateAppFunction");
+    if (!create) {
         std::cout << "Failed to find function: " << dlerror() << std::endl;
         dlclose(_handle);
         return false;
     }
-    // 清除之前的错误
-    dlerror();
-    _app = static_cast<IApplication*>((CreateAppFunc(func))());
+    _app = create();
     if (!_app) {
         std::cout << "pApp null " << std::endl;
         dlclose(_handle);
