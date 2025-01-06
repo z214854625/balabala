@@ -12,6 +12,7 @@ int main(int argc, char* argv[])
     bool res = pLauncher->StartApp(argc, argv);
     if (!res) {
         std::cout << "new AppLauncher failed." << std::endl;
+        delete pLauncher;
         return 0;
     }
     //执行
