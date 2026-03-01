@@ -17,7 +17,7 @@ public:
     void Start(int port, const std::string strIp);
 
 private:
-    std::unique_ptr<IConnection> conn_;
+    IConnection* conn_ = nullptr;  // 生命周期由EventLoop的mapConn_管理
     EventLoop loop_;
 };
 

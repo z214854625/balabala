@@ -22,7 +22,7 @@ Connection::~Connection()
 
 void Connection::OnRecv(RecvCallback&& callback)
 {
-    ConnectionBase::OnRecv(std::forward<RecvCallback>(callback));
+    ConnectionBase::OnRecv(std::move(callback));
 }
 
 void Connection::Send(const char* pData, int nLen)
@@ -42,5 +42,5 @@ void Connection::HandleWrite(int fd, uint32_t events)
 
 void Connection::OnDisconnected(DisConnCallback&& callback)
 {
-    ConnectionBase::OnDisconnected(std::forward<DisConnCallback>(callback));
+    ConnectionBase::OnDisconnected(std::move(callback));
 }

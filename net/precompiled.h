@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 #include <vector>
 #include <map>
@@ -22,6 +23,5 @@
 #include <list>
 #include <deque>
 #include <queue>
-
 
 //std

@@ -23,7 +23,7 @@ Acceptor::~Acceptor()
 
 void Acceptor::OnConnected(ConnCallback&& callback)
 {
-    connCallback_ = std::forward<ConnCallback>(callback);
+    connCallback_ = std::move(callback);
 }
 
 void Acceptor::HandleAccept(int listenFd, uint32_t events)

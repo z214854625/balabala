@@ -18,7 +18,7 @@ ConnectionBase::~ConnectionBase()
 
 void ConnectionBase::OnRecv(RecvCallback&& callback)
 {
-    recvCallback_ = std::forward<RecvCallback>(callback);
+    recvCallback_ = std::move(callback);
 }
 
 void ConnectionBase::Send(const char* pData, int nLen)
@@ -28,7 +28,7 @@ void ConnectionBase::Send(const char* pData, int nLen)
         return;
     }
     sendMQ_.push(std::string(pData, nLen));
-    loop_->GetPoller()->ModifyEvent(socket_, EPOLL_EVENTS_W);
+    loop_->GetPoller()->ModifyEvent(socket_, EPOLL_EVENTS_RW);
 }
 
 void ConnectionBase::HandleRead(int fd, uint32_t events)
@@ -49,15 +49,21 @@ void ConnectionBase::HandleRead(int fd, uint32_t events)
             break;
         } else if (n == 0) {
             std::cout << "Connection close! fd=" << fd << std::endl;
-            disConnCallback_(this);
+            // 先通知业务层断连，再移除连接（RemoveConnection会移除epoll事件+删除对象）
+            // 注意：disConnCallback_中不能再访问this，因为RemoveConnection会delete this
+            if (disConnCallback_) {
+                disConnCallback_(this);
+            }
+            // RemoveConnection 内部会先 RemoveEvent(fd) 再 delete Connection
+            // close(fd) 不再需要，因为 Connection 析构函数会 close
             loop_->RemoveConnection(fd);
-            close(fd);
             return;
         }
         std::string str(buffer, n);
         loop_->AddMsg({fd, std::move(str), recvCallback_}); //添加到要回到到主线程的消息队列
     }
-    loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_W);
+    // ET模式下读完数据后不修改epoll事件，保持当前监听状态
+    // 当业务层调用Send()时会自动添加EPOLLOUT
 }
 
 void ConnectionBase::HandleWrite(int fd, uint32_t events)
@@ -88,8 +94,8 @@ void ConnectionBase::HandleWrite(int fd, uint32_t events)
         const char* pData = strMsg.c_str();
         while (len > 0) {
             int n = write(fd, pData + offset, len);
-            std::cout << "Connection write fd= " << fd << ", n="<< n << ", errno=" << errno << std::endl;
             if (n < 0) {
+                std::cout << "Connection write fd= " << fd << ", n="<< n << ", errno=" << errno << std::endl;
                 if (errno == EINTR) { //被信号中断，继续读取
                     continue;
                 } else if (errno == EAGAIN || errno == EWOULDBLOCK) { //数据写入完毕，退出循环
@@ -107,11 +113,9 @@ void ConnectionBase::HandleWrite(int fd, uint32_t events)
                 }
             }
             else if(n == 0) {
-                std::cout << "Connection close! fd=" << fd << std::endl;
-                disConnCallback_(this);
-                loop_->RemoveConnection(fd);
-                close(fd);
-                return;
+                // write()返回0通常表示写入了0字节，不代表断连
+                std::cout << "Connection write 0 bytes! fd=" << fd << ", remaining=" << len << std::endl;
+                break;
             }
             else {
                 offset += n;
@@ -125,5 +129,5 @@ void ConnectionBase::HandleWrite(int fd, uint32_t events)
 
 void ConnectionBase::OnDisconnected(DisConnCallback&& callback)
 {
-    disConnCallback_ = std::forward<DisConnCallback>(callback);
+    disConnCallback_ = std::move(callback);
 }

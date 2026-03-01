@@ -12,52 +12,26 @@ EventLoop::EventLoop() : stop_(false)
 EventLoop::~EventLoop()
 {
     stop_ = true;
-    for (auto &th : threadPool_) {
-        if (th.joinable()) {
-            th.join();
-        }
+    if (loopThread_.joinable()) {
+        loopThread_.join();
     }
+    // 清理mapConn_中的Connection对象（由EventLoop通过new创建并管理）
+    // Acceptor/Connector不在mapConn_中，由TcpServer/TcpClient的unique_ptr管理
+    for (auto& [fd, pConn] : mapConn_) {
+        delete pConn;
+    }
+    mapConn_.clear();
 }
 
-void EventLoop::Create(int threadSize)
+void EventLoop::Create()
 {
-    //poller_ = std::make_unique<Epollor>(1024);
     poller_.reset(new Epollor(1024));
 
     if (poller_ == nullptr) {
         throw std::runtime_error("Failed to create epoll file descriptor");
     }
-    //队列任务线程
-    for (int i = 0; i < threadSize; i++) {
-        threadPool_.emplace_back(std::thread(&EventLoop::WorkerThread, this));
-    }
-    //loop线程
-    threadPool_.emplace_back(std::thread(&EventLoop::run, this, 25));
-}
-
-void EventLoop::WorkerThread()
-{
-    std::cout << "EventLoop::WorkerThread 1--" << std::endl;
-    while (true) {
-        if(stop_){
-            while(!taskQueue_.empty()) {
-                auto task = taskQueue_.pop();
-                if (task) {
-                    (*task)();
-                }
-            }
-            return;
-        }
-        if (taskQueue_.empty()){
-            usleep(25000);
-            continue;
-        }
-        auto task = taskQueue_.pop();
-        if (task) {
-            (*task)();
-        }
-    }
-    std::cout << "EventLoop::WorkerThread end!" << std::endl;
+    // 只启动一个epoll loop线程，所有I/O操作都在这个线程中串行执行
+    loopThread_ = std::thread(&EventLoop::run, this, 25);
 }
 
 void EventLoop::run(int timeout)
@@ -78,19 +52,21 @@ void EventLoop::run(int timeout)
         }
         const auto& firedEvents = poller_->GetFiredEvents();
         int len = (ready < (int)firedEvents.size() ?  ready : firedEvents.size());
-        //std::cout << "EventLoop::run event size=" << len << std::endl;
         for (int i = 0; i < len; ++i) {
             int fd = firedEvents[i].data.fd;
             uint32_t events = firedEvents[i].events;
-            bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_); //对callbacks_上锁
-            auto it = callbacks_.find(fd);
-            //std::cout << "EventLoop::run fd= " << fd << ", event= " << events << ", find= " << (it != callbacks_.end()) << std::endl;
-            if (it != callbacks_.end()) {
-                std::function<void()> task = [it, fd, events]() { it->second(fd, events); };
-                {
-                    taskQueue_.push(task);
-                    //std::cout << "EventLoop::run task enqueue. " << fd << std::endl;
+            // 拷贝回调，避免迭代器失效问题
+            Callback cb;
+            {
+                bllsll::LockGuard<bllsll::SpinLock> lock(cbSpinLock_);
+                auto it = callbacks_.find(fd);
+                if (it != callbacks_.end()) {
+                    cb = it->second; // 拷贝回调函数
                 }
+            }
+            // 直接在loop线程中执行I/O回调，保证同一fd的read/write串行
+            if (cb) {
+                cb(fd, events);
             }
         }
     }
@@ -102,9 +78,8 @@ void EventLoop::AddEvent(int fd, uint32_t events, Callback&& cb)
     if(poller_) {
         poller_->AddEvent(fd, events);
     }
-    bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_);
-    callbacks_[fd] = std::forward<Callback>(cb);
-    //std::cout << "EventLoop::AddEvent " << fd << std::endl;
+    bllsll::LockGuard<bllsll::SpinLock> lock(cbSpinLock_);
+    callbacks_[fd] = std::move(cb);
 }
 
 void EventLoop::ModifyEvent(int fd, uint32_t events, Callback&& cb)
@@ -112,9 +87,8 @@ void EventLoop::ModifyEvent(int fd, uint32_t events, Callback&& cb)
     if(poller_) {
         poller_->ModifyEvent(fd, events);
     }
-    bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_);
-    callbacks_[fd] = std::forward<Callback>(cb);
-    //std::cout << "EventLoop::ModifyEvent " << fd << std::endl;
+    bllsll::LockGuard<bllsll::SpinLock> lock(cbSpinLock_);
+    callbacks_[fd] = std::move(cb);
 }
 
 void EventLoop::RemoveEvent(int fd)
@@ -122,14 +96,12 @@ void EventLoop::RemoveEvent(int fd)
     if(poller_) {
         poller_->RemoveEvent(fd);
     }
-    bllsll::LockGuard<bllsll::SpinLock> lock(spinLock_);
+    bllsll::LockGuard<bllsll::SpinLock> lock(cbSpinLock_);
     callbacks_.erase(fd);
-    //std::cout << "EventLoop::RemoveEvent " << fd << std::endl;
 }
 
 void EventLoop::OnDispatch(int timeout)
 {
-    //std::cout << "EventLoop::OnDispatch timeout= " << timeout << std::endl;
     int64_t tick1 = GetMilliSeconds();
     while (true) {
         if (msgQueue_.empty()){
@@ -162,17 +134,19 @@ int64_t EventLoop::GetMilliSeconds(){
 
 void EventLoop::AddMsg(recvMsgType&& p)
 {
-    msgQueue_.push(std::forward<recvMsgType>(p));
+    msgQueue_.push(std::move(p));
 }
 
 void EventLoop::AddConnection(IConnection* pConn)
 {
+    bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
     mapConn_.insert({pConn->GetFd(), pConn});
     std::cout << "AddConnection fd=" << pConn->GetFd() << std::endl;
 }
 
 IConnection* EventLoop::GetConnection(int fd)
 {
+    bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
     auto it = mapConn_.find(fd);
     if (it == mapConn_.end()) {
         return nullptr;
@@ -182,6 +156,9 @@ IConnection* EventLoop::GetConnection(int fd)
 
 void EventLoop::RemoveConnection(int fd)
 {
+    // 先移除epoll事件和回调，再删除连接对象
+    RemoveEvent(fd);
+    bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
     auto it = mapConn_.find(fd);
     if (it != mapConn_.end()) {
         delete it->second;

@@ -40,6 +40,7 @@ protected:
 private:
     int port_;
     std::string strIp_;
+    bool connecting_ = false;
     ConnCallback connCallback_;
 };
 

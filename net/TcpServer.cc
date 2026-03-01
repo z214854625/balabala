@@ -7,10 +7,10 @@ using namespace std;
 void TcpServer::Start(int port)
 {
     std::cout << "TcpServer::Start 1--" << std::endl;
-    //启动eventloop
-    loop_.Create(4);
-    //启动tcp服务器
-    conn_.reset(new Acceptor(port, &loop_));
+    //启动eventloop（仅一个epoll loop线程，所有I/O在该线程中串行执行）
+    loop_.Create();
+    //启动tcp服务器（Acceptor由EventLoop的mapConn_管理生命周期）
+    conn_ = new Acceptor(port, &loop_);
     //收到连接
     conn_->OnConnected([&](IConnection* pCliConn) {
         std::cout << "new client connection! fd=" << pCliConn->GetFd() << std::endl;
