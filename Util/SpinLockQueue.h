@@ -25,13 +25,19 @@ public:
         lock.unlock();
     }
 
+    void push(T&& value) {
+        lock.lock();
+        queue.push(std::move(value));
+        lock.unlock();
+    }
+
     std::optional<T> pop() {
         lock.lock();
         if (queue.empty()) {
             lock.unlock();
             return std::nullopt;
         }
-        T value = queue.front();
+        T value = std::move(queue.front());
         queue.pop();
         lock.unlock();
         return value;
