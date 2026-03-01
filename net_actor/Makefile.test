@@ -1,8 +1,8 @@
-# Makefile.test - Actoré—´æ¶ˆæ¯æµ‹è¯•ä¸“ç”¨æ„å»ºæ–‡ä»¶
-# ç”¨æ³•: make -f Makefile.test
+# Makefile.test - Actor¼äÏûÏ¢²âÊÔ×¨ÓÃ¹¹½¨ÎÄ¼ş
+# ÓÃ·¨: make -f Makefile.test
 #
-# ç¼–è¯‘å®Œæ•´ç½‘ç»œæ ˆï¼ˆEventLoop + Epollor + Connection + Acceptor + Connectorï¼‰
-# ä»¥åŠ Actor æ ¸å¿ƒï¼ˆActor + ActorSystemï¼‰ï¼Œæ’é™¤ main.cc / TcpServer / TcpClient
+# ±àÒëÍêÕûÍøÂçÕ»£¨EventLoop + Epollor + Connection + Acceptor + Connector£©
+# ÒÔ¼° Actor ºËĞÄ£¨Actor + ActorSystem£©£¬ÅÅ³ı main.cc / TcpServer / TcpClient
 
 .PHONY: all clean
 
@@ -17,7 +17,7 @@ LDLIBS   = -ldl -pthread
 BIN_PATH = .
 TARGET   = test_actor_msg
 
-# éœ€è¦ç¼–è¯‘çš„æºæ–‡ä»¶ï¼ˆæ’é™¤ main.cc / TcpServer.cc / TcpClient.ccï¼‰
+# ĞèÒª±àÒëµÄÔ´ÎÄ¼ş£¨ÅÅ³ı main.cc / TcpServer.cc / TcpClient.cc£©
 TEST_SOURCES = test_actor_msg.cc \
                Actor.cc \
                ActorSystem.cc \
