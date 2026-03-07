@@ -155,6 +155,13 @@ void ActorSystem::Send(uint32_t actorId, ActorMessage&& msg)
     }
 }
 
+// [P3] A.10 发送高优先级消息
+void ActorSystem::SendPriority(uint32_t actorId, ActorMessage&& msg)
+{
+    msg.priority = true;
+    Send(actorId, std::move(msg));
+}
+
 Actor* ActorSystem::GetActor(uint32_t actorId)
 {
     bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
@@ -335,7 +342,7 @@ std::vector<ActorStat> ActorSystem::CollectActorStats()
 {
     std::vector<ActorStat> stats;
 
-    // Phase 1: 在 actorsLock_ 下收集 Actor 基础信息
+    // Phase 1: 在 actorsLock_ 下收集 Actor 基础信息 + [P2] A.9 指标数据
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
         stats.reserve(actors_.size());
@@ -344,6 +351,16 @@ std::vector<ActorStat> ActorSystem::CollectActorStats()
             stat.actorId = id;
             stat.mailboxSize = actor->GetMailboxSize();
             stat.scheduled = actor->scheduled_.load();
+
+            // [P2] A.9 从 ActorMetrics 获取指标数据
+            const auto& metrics = actor->GetMetrics();
+            stat.totalMsgProcessed = metrics.totalMsgProcessed.load();
+            stat.totalProcessTimeUs = metrics.totalProcessTimeUs.load();
+            stat.maxProcessTimeUs = metrics.maxProcessTimeUs.load();
+            stat.avgProcessTimeUs = metrics.AvgProcessTimeUs();
+            stat.maxMailboxSize = metrics.maxMailboxSize.load();
+            stat.totalPriorityMsgProcessed = metrics.totalPriorityMsgProcessed.load();
+
             stats.push_back(std::move(stat));
         }
     }

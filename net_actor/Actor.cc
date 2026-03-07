@@ -6,41 +6,90 @@ using namespace bllsll;
 
 void Actor::PushMessage(ActorMessage&& msg)
 {
-    mailbox_.push(std::move(msg));
+    // [P3] A.10 根据 priority 字段路由到对应队列
+    if (msg.priority) {
+        priorityMailbox_.push(std::move(msg));
+    } else {
+        normalMailbox_.push(std::move(msg));
+    }
+
     // [P1] 邮箱高水位告警
     if (mailboxHighWaterMark_ > 0) {
-        size_t sz = mailbox_.size();
+        size_t sz = GetMailboxSize();
         if (sz > mailboxHighWaterMark_) {
             std::cerr << "[WARN] Actor " << actorId_ << " mailbox high water mark exceeded: "
                       << sz << " > " << mailboxHighWaterMark_ << std::endl;
+        }
+    }
+
+    // [P2] A.9 更新历史最大邮箱大小
+    size_t currentSize = GetMailboxSize();
+    uint64_t prevMax = metrics_.maxMailboxSize.load();
+    while (currentSize > prevMax) {
+        if (metrics_.maxMailboxSize.compare_exchange_weak(prevMax, currentSize)) {
+            break;
         }
     }
 }
 
 bool Actor::ProcessOne()
 {
-    auto opt = mailbox_.pop();
+    // [P3] A.10 优先级队列优先处理
+    auto opt = priorityMailbox_.pop();
+    bool isPriority = opt.has_value();
+    if (!opt) {
+        opt = normalMailbox_.pop();
+    }
     if (!opt) {
         return false;
     }
+
+    // [P2] A.9 指标统计：计时
+    auto start = std::chrono::steady_clock::now();
     OnMessage(*opt);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    uint64_t elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+
+    metrics_.totalMsgProcessed.fetch_add(1);
+    metrics_.totalProcessTimeUs.fetch_add(elapsedUs);
+    if (isPriority) {
+        metrics_.totalPriorityMsgProcessed.fetch_add(1);
+    }
+
+    // 更新单条消息最大处理耗时
+    uint64_t prevMax = metrics_.maxProcessTimeUs.load();
+    while (elapsedUs > prevMax) {
+        if (metrics_.maxProcessTimeUs.compare_exchange_weak(prevMax, elapsedUs)) {
+            break;
+        }
+    }
+
     return true;
 }
 
 bool Actor::IsMailboxEmpty() const
 {
-    return mailbox_.empty();
+    return priorityMailbox_.empty() && normalMailbox_.empty();
 }
 
 size_t Actor::GetMailboxSize() const
 {
-    return mailbox_.size();
+    return priorityMailbox_.size() + normalMailbox_.size();
 }
 
 void Actor::SendToActor(uint32_t targetId, ActorMessage&& msg)
 {
     if (system_) {
         msg.sourceId = actorId_;
+        system_->Send(targetId, std::move(msg));
+    }
+}
+
+void Actor::SendPriorityToActor(uint32_t targetId, ActorMessage&& msg)
+{
+    if (system_) {
+        msg.sourceId = actorId_;
+        msg.priority = true;
         system_->Send(targetId, std::move(msg));
     }
 }

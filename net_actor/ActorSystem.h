@@ -4,13 +4,16 @@
 @date: 2025.3.1
 @brief: Actor系统，管理Actor生命周期、消息路由、工作线程池
 
-改进记录（P0/P1 优化）：
+改进记录（P0/P1/P2/P3 优化）：
   [P0] 异常保护：workerLoop 中 try-catch 包裹 ProcessOne，防止 worker 线程异常退出
   [P0] 定时器系统：集成 TimerManager，支持 SetTimeout/SetInterval/CancelTimer
   [P1] Actor命名：RegisterName/FindActor/SendByName，支持按名字查找和发送消息
   [P1] 邮箱容量控制：高水位告警（在 Actor::PushMessage 中实现）
   [P1] 优雅关停：Stop() 停止定时器→停止Worker→排空邮箱→清理协程
   [P2] Actor监控/Link：LinkActor/UnlinkActor + 周期性健康检查 StartMonitor
+  [P2] A.8 消息类型系统：ActorMessage 支持 std::any payload 类型安全传递
+  [P2] A.9 指标监控：ActorMetrics + ActorStat 扩展，支持耗时/消息计数统计
+  [P3] A.10 优先级消息：SendPriority 高优先级消息发送
 */
 
 #include "precompiled.h"
@@ -25,12 +28,19 @@ namespace bllsll {
 
 class EventLoop;
 
-// Actor 统计信息（用于监控报告）
+// [P2] A.9 Actor 统计信息（含指标数据，用于监控报告）
 struct ActorStat {
     uint32_t actorId = 0;
-    std::string name;         // 命名（未命名则为空）
-    size_t mailboxSize = 0;   // 当前邮箱积压量
-    bool scheduled = false;   // 是否在就绪队列中
+    std::string name;                   // 命名（未命名则为空）
+    size_t mailboxSize = 0;             // 当前邮箱积压量
+    bool scheduled = false;             // 是否在就绪队列中
+    // 指标数据
+    uint64_t totalMsgProcessed = 0;     // 累计处理消息数
+    uint64_t totalProcessTimeUs = 0;    // 累计处理耗时（微秒）
+    uint64_t maxProcessTimeUs = 0;      // 单条消息最大处理耗时
+    uint64_t avgProcessTimeUs = 0;      // 平均处理耗时
+    uint64_t maxMailboxSize = 0;        // 历史最大邮箱大小
+    uint64_t totalPriorityMsgProcessed = 0; // 累计优先级消息数
 };
 
 class ActorSystem
@@ -50,6 +60,8 @@ public:
     void UnregisterActor(uint32_t actorId);
     // 发消息给Actor
     void Send(uint32_t actorId, ActorMessage&& msg);
+    // [P3] A.10 发送高优先级消息给Actor
+    void SendPriority(uint32_t actorId, ActorMessage&& msg);
     // 获取Actor
     Actor* GetActor(uint32_t actorId);
     // 获取EventLoop
@@ -86,15 +98,12 @@ public:
 
     // ===== [P2] Actor监控/Link =====
     // Link: watcherId 监控 targetId，当 target 退出/注销时，watcher 收到 ActorDown 消息
-    //       类似 Erlang 的 monitor / Skynet 的 skynet.monitor
     void LinkActor(uint32_t watcherId, uint32_t targetId);
     // Unlink: 取消监控
     void UnlinkActor(uint32_t watcherId, uint32_t targetId);
-    // 启动周期性健康监控（每 intervalMs 毫秒给 reportActorId 发送 __monitor_tick__ 消息）
-    // 监控Actor收到tick后可调用 CollectActorStats() 遍历所有Actor状态
-    // 返回定时器ID，可用 CancelTimer 停止
+    // 启动周期性健康监控
     uint64_t StartMonitor(uint32_t reportActorId, int intervalMs);
-    // 收集所有Actor的统计快照（线程安全，可从任意线程调用）
+    // 收集所有Actor的统计快照（线程安全，含指标数据）
     std::vector<ActorStat> CollectActorStats();
 
 private:
@@ -133,7 +142,6 @@ private:
     std::unordered_map<uint32_t, std::string> actorToName_;  // 反向映射，用于注销时清理
 
     // [P2] Link 注册表: targetId → set<watcherId>
-    //      当 target 被注销时，向所有 watcher 发送 ActorDown 消息
     bllsll::SpinLock linkLock_;
     std::unordered_map<uint32_t, std::set<uint32_t>> linkMap_;
 };
