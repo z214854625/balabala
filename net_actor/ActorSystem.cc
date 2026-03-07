@@ -77,11 +77,15 @@ void ActorSystem::Stop()
         }
     }
 
-    // Phase 5: 清理名字映射
+    // Phase 5: 清理名字映射和 Link 注册表
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(nameLock_);
         nameToActor_.clear();
         actorToName_.clear();
+    }
+    {
+        bllsll::LockGuard<bllsll::SpinLock> lock(linkLock_);
+        linkMap_.clear();
     }
 
     std::cout << "ActorSystem stopped." << std::endl;
@@ -100,6 +104,9 @@ uint32_t ActorSystem::RegisterActor(std::unique_ptr<Actor> actor)
 
 void ActorSystem::UnregisterActor(uint32_t actorId)
 {
+    // [P2] Link 通知：在删除前，通知所有监控该 Actor 的 watcher
+    notifyActorDown(actorId, "unregistered");
+
     // 清理名字映射
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(nameLock_);
@@ -109,6 +116,18 @@ void ActorSystem::UnregisterActor(uint32_t actorId)
             actorToName_.erase(nameIt);
         }
     }
+
+    // 清理 Link 注册表中该 Actor 作为 watcher 的条目
+    {
+        bllsll::LockGuard<bllsll::SpinLock> lock(linkLock_);
+        // 移除该 Actor 作为 target 的记录（已在 notifyActorDown 中取出）
+        linkMap_.erase(actorId);
+        // 移除该 Actor 作为 watcher 出现在其他 target 的监控列表中
+        for (auto& [targetId, watchers] : linkMap_) {
+            watchers.erase(actorId);
+        }
+    }
+
     bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
     actors_.erase(actorId);
     std::cout << "UnregisterActor id=" << actorId << std::endl;
@@ -245,6 +264,102 @@ bool ActorSystem::SendByName(const std::string& name, ActorMessage&& msg)
     }
     std::cout << "ActorSystem::SendByName actor not found! name=\"" << name << "\"" << std::endl;
     return false;
+}
+
+// ================================================================
+//  [P2] Actor 监控/Link
+// ================================================================
+
+size_t ActorSystem::GetActorCount() const
+{
+    bllsll::LockGuard<bllsll::SpinLock> lock(const_cast<bllsll::SpinLock&>(actorsLock_));
+    return actors_.size();
+}
+
+void ActorSystem::LinkActor(uint32_t watcherId, uint32_t targetId)
+{
+    if (watcherId == targetId) {
+        std::cout << "[ActorSystem::LinkActor] cannot link actor to itself! id=" << watcherId << std::endl;
+        return;
+    }
+    bllsll::LockGuard<bllsll::SpinLock> lock(linkLock_);
+    linkMap_[targetId].insert(watcherId);
+    std::cout << "[ActorSystem::LinkActor] watcher=" << watcherId << " -> target=" << targetId << std::endl;
+}
+
+void ActorSystem::UnlinkActor(uint32_t watcherId, uint32_t targetId)
+{
+    bllsll::LockGuard<bllsll::SpinLock> lock(linkLock_);
+    auto it = linkMap_.find(targetId);
+    if (it != linkMap_.end()) {
+        it->second.erase(watcherId);
+        if (it->second.empty()) {
+            linkMap_.erase(it);
+        }
+    }
+    std::cout << "[ActorSystem::UnlinkActor] watcher=" << watcherId << " -> target=" << targetId << std::endl;
+}
+
+void ActorSystem::notifyActorDown(uint32_t targetId, const std::string& reason)
+{
+    // 取出所有 watcher（在 linkLock_ 下操作），然后在锁外发送消息（避免死锁）
+    std::set<uint32_t> watchers;
+    {
+        bllsll::LockGuard<bllsll::SpinLock> lock(linkLock_);
+        auto it = linkMap_.find(targetId);
+        if (it != linkMap_.end()) {
+            watchers = std::move(it->second);
+            linkMap_.erase(it);
+        }
+    }
+
+    // 在锁外发送 ActorDown 消息
+    for (uint32_t watcherId : watchers) {
+        std::string data = std::to_string(targetId) + ":" + reason;
+        Send(watcherId, ActorMessage{MsgType::ActorDown, targetId, -1, std::move(data)});
+        std::cout << "[ActorSystem] ActorDown notification: target=" << targetId
+                  << " -> watcher=" << watcherId << ", reason=" << reason << std::endl;
+    }
+}
+
+uint64_t ActorSystem::StartMonitor(uint32_t reportActorId, int intervalMs)
+{
+    // 使用 SetInterval 周期性给 reportActorId 发送 __monitor_tick__ 消息
+    // 监控Actor收到此消息后调用 CollectActorStats() 遍历所有Actor状态
+    return SetInterval(reportActorId, intervalMs, ActorMessage{
+        MsgType::UserMessage, 0, -1, "__monitor_tick__"
+    });
+}
+
+std::vector<ActorStat> ActorSystem::CollectActorStats()
+{
+    std::vector<ActorStat> stats;
+
+    // Phase 1: 在 actorsLock_ 下收集 Actor 基础信息
+    {
+        bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
+        stats.reserve(actors_.size());
+        for (auto& [id, actor] : actors_) {
+            ActorStat stat;
+            stat.actorId = id;
+            stat.mailboxSize = actor->GetMailboxSize();
+            stat.scheduled = actor->scheduled_.load();
+            stats.push_back(std::move(stat));
+        }
+    }
+
+    // Phase 2: 在 nameLock_ 下填充名字（避免嵌套锁）
+    {
+        bllsll::LockGuard<bllsll::SpinLock> lock(nameLock_);
+        for (auto& stat : stats) {
+            auto it = actorToName_.find(stat.actorId);
+            if (it != actorToName_.end()) {
+                stat.name = it->second;
+            }
+        }
+    }
+
+    return stats;
 }
 
 // ================================================================

@@ -17,6 +17,7 @@
 - [十三、与原有 Actor 模型的兼容性](#十三与原有-actor-模型的兼容性)
 - [十四、测试用例说明](#十四测试用例说明)
 - [十五、生产环境优化建议](#十五生产环境优化建议)
+- [十六、Actor 监控/Link 机制](#十六actor-监控link-机制)
 - [附录 A：架构完善性分析 — 现有框架的不足与改进方向](#附录-a架构完善性分析--现有框架的不足与改进方向)
 
 ---
@@ -1180,6 +1181,280 @@ CoroutineActor::~CoroutineActor() {
 
 ---
 
+## 十六、Actor 监控/Link 机制
+
+### 16.1 设计目标与 Skynet/Erlang 对标
+
+Actor 监控/Link 是成熟 Actor 框架的核心能力，解决以下问题：
+- **Actor 异常退出感知**：Actor A 监控 Actor B，B 退出时 A 收到通知
+- **防止协程泄漏**：`co_await Call(targetId, ...)` 的目标被注销时，调用方能感知并清理
+- **周期性健康检查**：系统级监控，遍历所有 Actor 的邮箱积压、调度状态
+
+| Erlang/OTP | Skynet | 本框架 C++20 | 功能说明 |
+|---|---|---|---|
+| `erlang:monitor(process, Pid)` | `skynet.monitor("exit", func)` | `LinkTo(targetId)` | 监控目标 Actor |
+| `erlang:demonitor(Ref)` | — | `UnlinkFrom(targetId)` | 取消监控 |
+| `{'DOWN', Ref, process, Pid, Reason}` | 回调通知 | `ActorDown` 消息 | 退出通知 |
+| — | — | `StartMonitor(actorId, ms)` | 周期性健康检查 |
+| — | — | `CollectActorStats()` | 收集全局 Actor 统计 |
+
+### 16.2 核心数据结构
+
+```
+  ActorSystem
+  ┌──────────────────────────────────────────────────┐
+  │  linkMap_: unordered_map<uint32_t, set<uint32_t>>│
+  │                                                   │
+  │  targetId=5 → {watcherId=1, watcherId=3}         │  Actor 1 和 3 都在监控 Actor 5
+  │  targetId=7 → {watcherId=1}                      │  Actor 1 还监控了 Actor 7
+  │                                                   │
+  │  linkLock_: SpinLock                              │  保护 linkMap_ 的自旋锁
+  └──────────────────────────────────────────────────┘
+```
+
+### 16.3 Link/Unlink 流程
+
+```
+  Actor 1 (Supervisor)              ActorSystem                    Actor 5 (Worker)
+       │                                │                               │
+       │  LinkTo(5)                     │                               │
+       │──────────────────────────────▷│                               │
+       │                                │ linkMap_[5].insert(1)         │
+       │                                │                               │
+       │                                │         ... 运行中 ...         │
+       │                                │                               │
+       │                                │◁─── UnregisterActor(5) ──────│
+       │                                │                               │
+       │                                │ 1. notifyActorDown(5, "unregistered")
+       │                                │    ├─ lock: watchers = linkMap_[5] → {1}
+       │                                │    ├─ unlock
+       │                                │    └─ Send(1, ActorDown{sourceId=5,
+       │                                │         data="5:unregistered"})
+       │◁─ ActorDown 消息 ─────────────│                               │
+       │                                │ 2. 清理名字映射                │
+       │  OnMessage():                  │ 3. 清理 linkMap 条目          │
+       │    msg.type == ActorDown       │ 4. actors_.erase(5)           │
+       │    msg.sourceId == 5           │                               │
+       │    msg.data == "5:unregistered"│                               │
+       │    → 处理子Actor退出           │                               │
+```
+
+### 16.4 锁安全设计
+
+**关键设计：锁外发消息，避免死锁**
+
+```cpp
+void ActorSystem::notifyActorDown(uint32_t targetId, const std::string& reason)
+{
+    // ① 在 linkLock_ 下取出 watchers（快速）
+    std::set<uint32_t> watchers;
+    {
+        LockGuard<SpinLock> lock(linkLock_);
+        auto it = linkMap_.find(targetId);
+        if (it != linkMap_.end()) {
+            watchers = std::move(it->second);
+            linkMap_.erase(it);
+        }
+    }
+    // ② 在锁外发送消息（避免 linkLock_ → actorsLock_ 嵌套死锁）
+    for (uint32_t watcherId : watchers) {
+        Send(watcherId, ActorMessage{MsgType::ActorDown, targetId, -1, ...});
+    }
+}
+```
+
+**锁顺序约定（防止死锁）：**
+
+```
+获取顺序: linkLock_ → 释放 → actorsLock_（通过 Send()）
+         nameLock_ → 释放 → actorsLock_（通过 Send()）
+绝不能: 持有 actorsLock_ 的同时获取 linkLock_ 或 nameLock_
+```
+
+### 16.5 UnregisterActor 完整清理流程
+
+当一个 Actor 被注销时，需要清理三方面数据：
+
+```
+UnregisterActor(actorId=5):
+  │
+  ├─ ① notifyActorDown(5, "unregistered")
+  │     → 向所有 watcher 发送 ActorDown 消息
+  │     → 清理 linkMap_[5]（作为 target 的条目）
+  │
+  ├─ ② 清理名字映射
+  │     → nameLock_ 下：actorToName_.erase(5), nameToActor_.erase(name)
+  │
+  ├─ ③ 清理 Link 注册表（作为 watcher 的角色）
+  │     → linkLock_ 下：遍历所有 linkMap_ 条目，移除 watcherId=5
+  │     → 确保 Actor 5 不会在其他 Actor 退出时收到无效通知
+  │
+  └─ ④ 删除 Actor
+        → actorsLock_ 下：actors_.erase(5)
+```
+
+### 16.6 周期性健康监控
+
+使用 TimerManager 的 `SetInterval` 实现周期性遍历所有 Actor 状态：
+
+```
+  ┌───────────────────────────────────────────────────────────────┐
+  │                    监控架构                                     │
+  │                                                                 │
+  │   TimerManager ──SetInterval──▷ MonitorActor (每 N 秒)          │
+  │                                      │                          │
+  │                        收到 __monitor_tick__ 消息                │
+  │                                      │                          │
+  │                                      ▼                          │
+  │                        CollectActorStats()                      │
+  │                        ┌──────────────────────────┐             │
+  │                        │ Phase 1 (actorsLock_):   │             │
+  │                        │   遍历 actors_           │             │
+  │                        │   收集 id, mailboxSize,  │             │
+  │                        │         scheduled        │             │
+  │                        ├──────────────────────────┤             │
+  │                        │ Phase 2 (nameLock_):     │             │
+  │                        │   填充 name (命名映射)    │             │
+  │                        └──────────────────────────┘             │
+  │                                      │                          │
+  │                                      ▼                          │
+  │                        返回 vector<ActorStat>                   │
+  │                        MonitorActor 输出/上报统计                │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+**ActorStat 统计快照结构：**
+
+```cpp
+struct ActorStat {
+    uint32_t actorId;        // Actor ID
+    std::string name;        // 命名（未命名为空）
+    size_t mailboxSize;      // 当前邮箱积压量
+    bool scheduled;          // 是否在就绪队列中等待处理
+};
+```
+
+### 16.7 使用示例
+
+#### 示例1：Supervisor 模式（子 Actor 退出时自动重启）
+
+```cpp
+class SupervisorActor : public Actor {
+    uint32_t childId_ = 0;
+
+    void StartChild() {
+        auto child = std::make_unique<WorkerActor>();
+        childId_ = GetSystem()->RegisterActor(std::move(child));
+        LinkTo(childId_);  // 监控子 Actor
+        std::cout << "Started child actor id=" << childId_ << std::endl;
+    }
+
+    void OnMessage(ActorMessage& msg) override {
+        switch (msg.type) {
+        case MsgType::ActorDown:
+            // 子 Actor 退出，自动重启
+            std::cout << "Child actor " << msg.sourceId << " down: "
+                      << msg.data << ", restarting..." << std::endl;
+            StartChild();
+            break;
+        case MsgType::UserMessage:
+            if (msg.data == "start") {
+                StartChild();
+            }
+            break;
+        default:
+            break;
+        }
+    }
+};
+```
+
+#### 示例2：周期性健康检查 Actor
+
+```cpp
+class HealthMonitorActor : public Actor {
+    void OnMessage(ActorMessage& msg) override {
+        if (msg.data == "__monitor_tick__") {
+            auto stats = GetSystem()->CollectActorStats();
+            std::cout << "=== Health Report ===" << std::endl;
+            std::cout << "Total actors: " << stats.size() << std::endl;
+            for (auto& s : stats) {
+                // 检测邮箱积压过高的 Actor
+                if (s.mailboxSize > 100) {
+                    std::cerr << "[WARN] Actor " << s.actorId
+                              << " (name=" << s.name << ")"
+                              << " mailbox=" << s.mailboxSize
+                              << " OVERLOADED!" << std::endl;
+                }
+            }
+        }
+    }
+};
+
+// 启动监控：每 5 秒检查一次
+uint32_t monitorId = sys.RegisterActor(std::make_unique<HealthMonitorActor>());
+uint64_t timerId = sys.StartMonitor(monitorId, 5000);
+// 停止监控
+sys.CancelTimer(timerId);
+```
+
+#### 示例3：协程 Actor 中使用 Link 防止 Call 泄漏
+
+```cpp
+class GameServiceActor : public CoroutineActor {
+    ActorTask OnCoroutineMessage(ActorMessage msg) override {
+        if (msg.data == "query_battle") {
+            uint32_t battleId = FindActorByName("battle_service");
+            LinkTo(battleId);  // 监控 BattleActor
+
+            // 如果 BattleActor 在此期间退出，
+            // 本 Actor 会收到 ActorDown 消息
+            auto result = co_await Call(battleId,
+                ActorMessage{MsgType::UserMessage, 0, -1, "get_status"});
+
+            UnlinkFrom(battleId);
+            std::cout << "Battle status: " << result.data << std::endl;
+        }
+    }
+
+    // ActorDown 消息会通过 OnMessage 分发，
+    // 在 CoroutineActor 中可以扩展处理：
+    // 清理所有等待该 Actor 响应的协程句柄
+};
+```
+
+### 16.8 涉及文件修改清单
+
+| 文件 | 修改内容 | 说明 |
+|---|---|---|
+| `Message.h` | `MsgType` 枚举新增 `ActorDown` | 被 Link 的 Actor 退出时发送给 watcher 的消息类型 |
+| `ActorSystem.h` | 新增 `ActorStat` 结构体 | 监控统计快照 |
+| `ActorSystem.h` | 新增 `LinkActor()` / `UnlinkActor()` | 注册/取消监控关系 |
+| `ActorSystem.h` | 新增 `StartMonitor()` | 启动周期性健康检查定时器 |
+| `ActorSystem.h` | 新增 `CollectActorStats()` | 收集所有 Actor 统计快照 |
+| `ActorSystem.h` | 新增 `GetActorCount()` | 获取当前 Actor 数量 |
+| `ActorSystem.h` | 新增 `linkMap_` + `linkLock_` | Link 注册表存储 |
+| `ActorSystem.cc` | 实现 `LinkActor()` / `UnlinkActor()` | 操作 linkMap_ |
+| `ActorSystem.cc` | 新增 `notifyActorDown()` 私有方法 | 锁外发送 ActorDown 消息 |
+| `ActorSystem.cc` | 修改 `UnregisterActor()` | 退出前通知 watcher + 清理 linkMap |
+| `ActorSystem.cc` | 实现 `CollectActorStats()` | 分段加锁收集统计 |
+| `ActorSystem.cc` | 修改 `Stop()` | Phase 5 增加 linkMap_ 清理 |
+| `Actor.h` | 新增 `LinkTo()` / `UnlinkFrom()` protected 方法 | Actor 基类辅助方法 |
+| `Actor.cc` | 实现 `LinkTo()` / `UnlinkFrom()` | 委托给 `system_->LinkActor()` |
+
+### 16.9 线程安全分析
+
+| 操作 | 涉及的锁 | 安全性说明 |
+|---|---|---|
+| `LinkActor()` | `linkLock_` | 单锁操作，安全 |
+| `UnlinkActor()` | `linkLock_` | 单锁操作，安全 |
+| `notifyActorDown()` | `linkLock_` → 释放 → `Send()` 内部获取 `actorsLock_` | 分段加锁，无嵌套，安全 |
+| `UnregisterActor()` | `notifyActorDown()` → `nameLock_` → `linkLock_` → `actorsLock_` | 顺序获取且每段独立释放，安全 |
+| `CollectActorStats()` | `actorsLock_` → 释放 → `nameLock_` | 分段加锁，无嵌套，安全 |
+| `StartMonitor()` | 通过 `SetInterval()` → `TimerManager` | TimerManager 有自己的锁，与 Actor 锁无关 |
+
+---
+
 ## 附录 A：架构完善性分析 — 现有框架的不足与改进方向
 
 本节从成熟 Actor 框架（Skynet、Akka、Orleans）的角度，全面审视当前框架在**同步/异步支持之外**还缺少哪些关键能力。
@@ -1397,50 +1672,21 @@ void Actor::PushMessage(ActorMessage&& msg) {
 
 ---
 
-### A.6 Actor 监控与 Link（Watch / Monitor）— 重要度：⭐⭐⭐
+### A.6 Actor 监控与 Link（Watch / Monitor）— 重要度：⭐⭐⭐ ✅ 已实现
 
-**现状问题：**
+> **已实现：** 详见 [十六、Actor 监控/Link 机制](#十六actor-监控link-机制)
 
-一个 Actor 无法知道另一个 Actor 是否"死亡"（被 Unregister 或异常退出）。
+**实现内容：**
+- `LinkActor(watcherId, targetId)` / `UnlinkActor()` — 注册/取消监控
+- `ActorDown` 消息类型 — target 退出时自动通知所有 watcher
+- `StartMonitor(reportActorId, intervalMs)` — 周期性健康检查
+- `CollectActorStats()` — 收集所有 Actor 的统计快照
+- `Actor::LinkTo()` / `Actor::UnlinkFrom()` — Actor 基类辅助方法
 
-**场景举例：**
-`PlayerActor` 正在与 `BattleActor` 战斗，`BattleActor` 被意外注销 → `PlayerActor` 的 `co_await Call(battleId, ...)` 永远等不到响应 → **协程泄漏**。
-
-**Skynet 的做法：**
-```lua
-skynet.monitor("exit", function(name) ... end)
-```
-
-**改进建议：**
-
-```cpp
-class ActorSystem {
-public:
-    // 监控：当 targetId 被注销时，通知 watcherId
-    void Watch(uint32_t watcherId, uint32_t targetId);
-    void Unwatch(uint32_t watcherId, uint32_t targetId);
-
-    void UnregisterActor(uint32_t actorId) {
-        // 在注销前，通知所有 watcher
-        for (uint32_t wid : watchers_[actorId]) {
-            Send(wid, ActorMessage{MsgType::ActorDown, actorId, -1, ""});
-        }
-        // ... 原有注销逻辑
-    }
-};
-```
-
-这也解决了 **Call 超时 / 目标不存在** 的问题：
-```cpp
-// CoroutineActor 处理 ActorDown 消息
-void OnMessage(ActorMessage& msg) override {
-    if (msg.type == MsgType::ActorDown) {
-        // 清理所有等待该 Actor 响应的协程
-        CancelWaitingForActor(msg.sourceId);
-    }
-    // ...
-}
-```
+**涉及文件修改：**
+- `Message.h` — 新增 `MsgType::ActorDown`
+- `ActorSystem.h/cc` — Link 注册表、健康监控、统计收集
+- `Actor.h/cc` — Link 辅助方法
 
 ---
 
@@ -1644,20 +1890,22 @@ class Actor {
 根据**游戏服务器实际需求**排列优先级：
 
 ```
-优先级    改进项                          原因
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-P0       异常保护 (A.2)                  不做就是线上事故，worker 线程会死
-P0       定时器/Tick (A.3)               游戏服务器核心需求，当前只有协程Sleep
-P1       Actor 命名 (A.4)               易用性大幅提升，代码更清晰
-P1       邮箱容量控制 (A.5)              防止 OOM，保护线上稳定性
-P1       优雅关停 (A.7)                  防止消息丢失和协程泄漏
-P2       Actor 监控/Link (A.6)          解决 Call 目标不存在时的协程泄漏
-P2       消息类型系统 (A.8)              提升开发效率和运行时性能
-P2       指标监控 (A.9)                  线上问题定位能力
-P3       优先级消息 (A.10)              控制消息需要优先处理
-P3       跨进程集群 (A.11)              后期扩展需求
-P3       Actor 热更新                    运行时不停服更新（可选）
+优先级    改进项                          原因                              状态
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+P0       异常保护 (A.2)                  不做就是线上事故，worker 线程会死    ✅ 已实现
+P0       定时器/Tick (A.3)               游戏服务器核心需求                   ✅ 已实现
+P1       Actor 命名 (A.4)               易用性大幅提升，代码更清晰            ✅ 已实现
+P1       邮箱容量控制 (A.5)              防止 OOM，保护线上稳定性              ✅ 已实现
+P1       优雅关停 (A.7)                  防止消息丢失和协程泄漏               ✅ 已实现
+P2       Actor 监控/Link (A.6)          解决 Call 目标不存在时的协程泄漏      ✅ 已实现
+P2       消息类型系统 (A.8)              提升开发效率和运行时性能             待实现
+P2       指标监控 (A.9)                  线上问题定位能力                     待实现
+P3       优先级消息 (A.10)              控制消息需要优先处理                  待实现
+P3       跨进程集群 (A.11)              后期扩展需求                         待实现
+P3       Actor 热更新                    运行时不停服更新（可选）             待实现
 ```
 
-> **结论：当前框架的核心通信模型（邮箱串行 + 工作线程池 + 协程 Call/Response）是完善的。
-> 最需要补充的是 P0 级别的异常保护和定时器支持——前者关系到系统稳定性，后者是游戏服务器的基础设施。**
+> **当前状态：P0/P1/P2(A.6) 共 6 项改进已全部实现。
+> 框架已具备：异常保护、定时器系统、Actor 命名/发现、邮箱容量控制、优雅关停、
+> Actor 监控/Link（含周期性健康检查和 ActorDown 通知）等核心能力。
+> 剩余 P2/P3 项为进一步优化方向。**

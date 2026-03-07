@@ -16,6 +16,7 @@ enum class MsgType : uint32_t {
     Connected,        // 新连接建立
     Disconnected,     // 连接断开
     UserMessage,      // 用户自定义消息
+    ActorDown,        // 被 Link 的 Actor 退出/注销（data 中含退出原因）
 };
 
 struct ActorMessage {

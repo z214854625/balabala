@@ -4,10 +4,11 @@
 @date: 2025.3.1
 @brief: Actor基类，每个Actor拥有独立的邮箱(mailbox)，消息串行处理
 
-改进记录（P0/P1 优化）：
+改进记录（P0/P1/P2 优化）：
   [P0] 定时器辅助：SetTimeout/SetInterval/CancelTimer（委托给ActorSystem）
   [P1] 命名辅助：FindActorByName/SendByName（委托给ActorSystem）
   [P1] 邮箱高水位：SetMailboxHighWaterMark()，超过水位时打印告警
+  [P2] 监控/Link辅助：LinkTo/UnlinkFrom，被监控Actor退出时收到ActorDown消息
 */
 
 #include "precompiled.h"
@@ -68,6 +69,12 @@ protected:
     uint32_t FindActorByName(const std::string& name);
     // 按名字发送消息
     bool SendByName(const std::string& name, ActorMessage&& msg);
+
+    // ===== [P2] 监控/Link 辅助方法 =====
+    // 监控目标Actor（target退出时本Actor收到 ActorDown 消息）
+    void LinkTo(uint32_t targetActorId);
+    // 取消监控
+    void UnlinkFrom(uint32_t targetActorId);
 
     uint32_t actorId_ = 0;
     ActorSystem* system_ = nullptr;

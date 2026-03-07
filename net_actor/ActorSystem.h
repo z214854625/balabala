@@ -10,6 +10,7 @@
   [P1] Actor命名：RegisterName/FindActor/SendByName，支持按名字查找和发送消息
   [P1] 邮箱容量控制：高水位告警（在 Actor::PushMessage 中实现）
   [P1] 优雅关停：Stop() 停止定时器→停止Worker→排空邮箱→清理协程
+  [P2] Actor监控/Link：LinkActor/UnlinkActor + 周期性健康检查 StartMonitor
 */
 
 #include "precompiled.h"
@@ -24,6 +25,14 @@ namespace bllsll {
 
 class EventLoop;
 
+// Actor 统计信息（用于监控报告）
+struct ActorStat {
+    uint32_t actorId = 0;
+    std::string name;         // 命名（未命名则为空）
+    size_t mailboxSize = 0;   // 当前邮箱积压量
+    bool scheduled = false;   // 是否在就绪队列中
+};
+
 class ActorSystem
 {
 public:
@@ -37,7 +46,7 @@ public:
 
     // 注册Actor，返回actorId
     uint32_t RegisterActor(std::unique_ptr<Actor> actor);
-    // 注销Actor
+    // 注销Actor（会触发 Link 通知，向所有 watcher 发送 ActorDown 消息）
     void UnregisterActor(uint32_t actorId);
     // 发消息给Actor
     void Send(uint32_t actorId, ActorMessage&& msg);
@@ -45,6 +54,8 @@ public:
     Actor* GetActor(uint32_t actorId);
     // 获取EventLoop
     EventLoop* GetEventLoop() { return loop_; }
+    // 获取当前注册的Actor数量
+    size_t GetActorCount() const;
 
     // ===== fd到actorId的映射管理 =====
     void BindFdToActor(int fd, uint32_t actorId);
@@ -73,8 +84,23 @@ public:
     // 按名字发消息
     bool SendByName(const std::string& name, ActorMessage&& msg);
 
+    // ===== [P2] Actor监控/Link =====
+    // Link: watcherId 监控 targetId，当 target 退出/注销时，watcher 收到 ActorDown 消息
+    //       类似 Erlang 的 monitor / Skynet 的 skynet.monitor
+    void LinkActor(uint32_t watcherId, uint32_t targetId);
+    // Unlink: 取消监控
+    void UnlinkActor(uint32_t watcherId, uint32_t targetId);
+    // 启动周期性健康监控（每 intervalMs 毫秒给 reportActorId 发送 __monitor_tick__ 消息）
+    // 监控Actor收到tick后可调用 CollectActorStats() 遍历所有Actor状态
+    // 返回定时器ID，可用 CancelTimer 停止
+    uint64_t StartMonitor(uint32_t reportActorId, int intervalMs);
+    // 收集所有Actor的统计快照（线程安全，可从任意线程调用）
+    std::vector<ActorStat> CollectActorStats();
+
 private:
     void workerLoop();
+    // Link 内部：当 targetId 退出时，通知所有 watcher
+    void notifyActorDown(uint32_t targetId, const std::string& reason);
 
     EventLoop* loop_ = nullptr;
     std::atomic<bool> running_{false};
@@ -105,6 +131,11 @@ private:
     bllsll::SpinLock nameLock_;
     std::unordered_map<std::string, uint32_t> nameToActor_;
     std::unordered_map<uint32_t, std::string> actorToName_;  // 反向映射，用于注销时清理
+
+    // [P2] Link 注册表: targetId → set<watcherId>
+    //      当 target 被注销时，向所有 watcher 发送 ActorDown 消息
+    bllsll::SpinLock linkLock_;
+    std::unordered_map<uint32_t, std::set<uint32_t>> linkMap_;
 };
 
 } // namespace bllsll

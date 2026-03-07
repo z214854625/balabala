@@ -117,3 +117,21 @@ bool Actor::SendByName(const std::string& name, ActorMessage&& msg)
     }
     return false;
 }
+
+// ================================================================
+//  [P2] 监控/Link 辅助方法（委托给 ActorSystem）
+// ================================================================
+
+void Actor::LinkTo(uint32_t targetActorId)
+{
+    if (system_) {
+        system_->LinkActor(actorId_, targetActorId);
+    }
+}
+
+void Actor::UnlinkFrom(uint32_t targetActorId)
+{
+    if (system_) {
+        system_->UnlinkActor(actorId_, targetActorId);
+    }
+}
