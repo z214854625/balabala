@@ -1,8 +1,8 @@
-# Makefile.test - Actor???????????��??????
-# ?��?: make -f Makefile.test
+# Makefile.test - Actor间消息测试专用构建文件
+# 用法: make -f Makefile.test
 #
-# ???????????????EventLoop + Epollor + Connection + Acceptor + Connector??
-# ??? Actor ?????Actor + ActorSystem??????? main.cc / TcpServer / TcpClient
+# 编译完整网络栈（EventLoop + Epollor + Connection + Acceptor + Connector）
+# 以及 Actor 核心（Actor + ActorSystem），排除 main.cc / TcpServer / TcpClient
 
 .PHONY: all clean
 
@@ -17,18 +17,18 @@ LDLIBS   = -ldl -pthread
 BIN_PATH = .
 TARGET   = test_actor_msg
 
-# ????????????????? main.cc / TcpServer.cc / TcpClient.cc??
+# 需要编译的源文件（排除 main.cc / TcpServer.cc / TcpClient.cc）
 TEST_SOURCES = test_actor_msg.cc \
-               Actor.cc \
-               ActorSystem.cc \
-               Timer.cc \
-               EventLoop.cc \
-               Epollor.cc \
-               ConnectionBase.cc \
-               Connection.cc \
-               Acceptor.cc \
-               Connector.cc \
-               IOHelper.cc
+                Actor.cc \
+                ActorSystem.cc \
+                Timer.cc \
+                EventLoop.cc \
+                Epollor.cc \
+                ConnectionBase.cc \
+                Connection.cc \
+                Acceptor.cc \
+                Connector.cc \
+                IOHelper.cc
 
 OBJECT_PATH    = ../Obj/NetTest
 OBJECTS        = $(patsubst %.cc,$(OBJECT_PATH)/%.o,$(TEST_SOURCES))
