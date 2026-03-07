@@ -1,0 +1,43 @@
+.PHONY: all clean
+
+CXX      = g++
+CXXFLAGS = -Wall -g -m64 -fPIC -std=c++20 -fcoroutines -pthread -MMD -MP -include precompiled.h
+INCLUDE  = -I./
+LDFLAGS  = -L./
+LDLIBS   = -ldl -pthread
+
+TARGET   = test_coroutine_actor
+
+# 协程测试源文件 + Actor框架核心文件
+SOURCES  = test_coroutine_actor.cc \
+           CoroutineActor.cc \
+           Actor.cc \
+           ActorSystem.cc \
+           Timer.cc \
+           EventLoop.cc \
+           Epollor.cc \
+           ConnectionBase.cc \
+           Connection.cc \
+           Acceptor.cc \
+           Connector.cc \
+           IOHelper.cc
+
+OBJ_DIR  = ../Obj/NetCoroutine
+OBJECTS  = $(patsubst %.cc,$(OBJ_DIR)/%.o,$(SOURCES))
+DEPS     = $(OBJECTS:.o=.d)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
+$(OBJ_DIR)/%.o: %.cc | $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c $< $(INCLUDE) -o $@
+
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+-include $(DEPS)
+
+clean:
+	rm -rf $(OBJ_DIR) $(TARGET)

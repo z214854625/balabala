@@ -12,6 +12,7 @@ TARGET   = test_actor_msg
 SOURCES  = test_actor_msg.cc \
            Actor.cc \
            ActorSystem.cc \
+           Timer.cc \
            EventLoop.cc \
            Epollor.cc \
            ConnectionBase.cc \

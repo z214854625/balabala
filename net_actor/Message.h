@@ -23,6 +23,8 @@ struct ActorMessage {
     uint32_t sourceId = 0;     // 来源actor id (0表示系统/网络消息)
     int fd = -1;               // 关联的fd
     std::string data;          // 消息数据
+    uint32_t sessionId = 0;    // 协程会话ID（用于Call/Response配对）
+    bool isResponse = false;   // 是否为Call的响应消息
 
     ActorMessage() = default;
     ActorMessage(MsgType t, uint32_t src, int f, std::string d)
