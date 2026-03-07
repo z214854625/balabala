@@ -3,16 +3,19 @@
 @auther: chencaiyu
 @date: 2025.3
 @brief: C++20 协程支持 — Skynet 风格的服务协程调用
-        定义 ActorTask（协程返回类型）、CallAwaiter（阻塞式RPC）、SleepAwaiter（协程休眠）
+        定义 ActorTask（协程返回类型）、CallAwaiter（本地阻塞式RPC）、
+        ClusterCallAwaiter（跨进程阻塞式RPC）、SleepAwaiter（协程休眠）
 
 核心思想（对标 Skynet）：
-  Skynet:  skynet.call(addr, ...)  -- 发消息并挂起当前协程，等待响应
-           skynet.ret(...)          -- 响应调用者
-           skynet.sleep(n)          -- 协程休眠
+  Skynet:  skynet.call(addr, ...)         -- 发消息并挂起当前协程，等待响应
+           skynet.ret(...)                -- 响应调用者
+           skynet.sleep(n)                -- 协程休眠
   
-  本框架: co_await Call(actorId, msg)  -- 发消息并挂起当前协程，等待响应
-          RespondToCall(req, resp)    -- 响应调用者
-          co_await Sleep(ms)          -- 协程休眠
+  本框架: co_await Call(actorId, msg)     -- 本地RPC：发消息并挂起，等待响应
+          co_await ClusterCall(nodeId, actorName, msg)  -- 跨进程RPC：发消息到远端并挂起
+          RespondToCall(req, resp)        -- 响应调用者（本地）
+          RespondRemote(req, data)        -- 响应调用者（跨进程）
+          co_await Sleep(ms)              -- 协程休眠
 */
 
 #include <coroutine>
@@ -71,6 +74,39 @@ struct CallAwaiter
     // 挂起时：注册等待、发送消息
     void await_suspend(std::coroutine_handle<> h);
     // 恢复时：取出响应消息
+    ActorMessage await_resume();
+};
+
+// ============================================================
+//  ClusterCallAwaiter: co_await ClusterCall(nodeId, actorName, msg)
+//
+//  跨进程版本的 CallAwaiter，类似 Skynet 的 cluster.call()：
+//  1. 分配 sessionId
+//  2. 将当前协程句柄存入 waitMap_
+//  3. 调用 Actor::SendToRemote() 通过 TCP 发送到远端节点
+//  4. 挂起当前协程
+//  5. 远端 Actor 处理后调用 RespondRemote() 发回响应
+//  6. 响应通过 TCP 返回 → ClusterGatewayActor 解码
+//     → SendByName 路由到本地调用方 Actor 的邮箱
+//  7. OnMessage() 检测 isResponse=true → ResumeWaiting → 协程恢复
+//  8. await_resume() 返回响应消息
+//
+//  注意：调用方 Actor 必须已通过 RegisterName() 注册名字，
+//        否则远端无法通过 sourceActorName 将响应路由回来！
+// ============================================================
+struct ClusterCallAwaiter
+{
+    CoroutineActor* actor;
+    std::string targetNodeId;
+    std::string targetActorName;
+    ActorMessage msg;
+    uint32_t sessionId = 0;
+
+    // 永远不会立即就绪（必须发送到远端并等待）
+    bool await_ready() const noexcept { return false; }
+    // 挂起时：注册等待、通过 SendToRemote 发送跨进程消息
+    void await_suspend(std::coroutine_handle<> h);
+    // 恢复时：取出响应消息（与 CallAwaiter 相同的机制）
     ActorMessage await_resume();
 };
 

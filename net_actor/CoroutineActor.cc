@@ -1,15 +1,15 @@
 /**
  * @file CoroutineActor.cc
- * @brief CoroutineActor 实现 + CallAwaiter / SleepAwaiter 的 await_suspend / await_resume 实现
+ * @brief CoroutineActor 实现 + CallAwaiter / ClusterCallAwaiter / SleepAwaiter 实现
  *
  * 协程生命周期：
  *   1. 新消息到达 → OnMessage() → OnCoroutineMessage(move(msg))
  *      → 协程帧在堆上分配（编译器自动），立即执行（initial_suspend = suspend_never）
- *   2. 遇到 co_await Call(...) → await_suspend:
+ *   2. 遇到 co_await Call(...) 或 co_await ClusterCall(...) → await_suspend:
  *      → 分配 sessionId，存储 coroutine_handle 到 waitMap_
- *      → 发送消息给目标 Actor
+ *      → 发送消息给目标 Actor（本地或远程）
  *      → 返回（协程挂起，OnMessage 返回，ProcessOne 返回，worker 线程释放）
- *   3. 目标 Actor 处理完毕，调用 RespondToCall() 发回响应
+ *   3. 目标 Actor 处理完毕，调用 RespondToCall() 或 RespondRemote() 发回响应
  *   4. 响应消息到达邮箱 → ProcessOne → OnMessage
  *      → 检测 isResponse=true → ResumeWaiting:
  *      → 从 waitMap_ 取出 coroutine_handle
@@ -22,6 +22,7 @@
  *   [P0] SleepAwaiter 改用 TimerManager（ActorSystem::SetTimeout），
  *        不再启动 detached thread
  *   [P1] 添加 DestroyAllCoroutines() 用于优雅关停时清理悬挂协程
+ *   [P3] 添加 ClusterCallAwaiter 支持跨进程协程 RPC（co_await ClusterCall）
  */
 
 #include "CoroutineActor.h"
@@ -61,6 +62,13 @@ void CoroutineActor::OnMessage(ActorMessage& msg)
 CallAwaiter CoroutineActor::Call(uint32_t targetId, ActorMessage&& msg)
 {
     return CallAwaiter{this, targetId, std::move(msg)};
+}
+
+ClusterCallAwaiter CoroutineActor::ClusterCall(const std::string& targetNodeId,
+                                                const std::string& targetActorName,
+                                                ActorMessage&& msg)
+{
+    return ClusterCallAwaiter{this, targetNodeId, targetActorName, std::move(msg)};
 }
 
 void CoroutineActor::Respond(const ActorMessage& request, ActorMessage&& response)
@@ -138,6 +146,53 @@ void CallAwaiter::await_suspend(std::coroutine_handle<> h)
 ActorMessage CallAwaiter::await_resume()
 {
     // 从 responseMap_ 取出响应消息
+    auto it = actor->responseMap_.find(sessionId);
+    ActorMessage result;
+    if (it != actor->responseMap_.end()) {
+        result = std::move(it->second);
+        actor->responseMap_.erase(it);
+    }
+    return result;
+}
+
+// ================================================================
+//  ClusterCallAwaiter 实现 — 跨进程协程 RPC
+//
+//  与 CallAwaiter 的唯一区别：
+//    CallAwaiter:        actor->SendToActor(targetId, msg)      本地路由
+//    ClusterCallAwaiter: actor->SendToRemote(nodeId, name, msg) TCP跨进程
+//
+//  回程路径（自动工作，无需额外代码）：
+//    远端 RespondRemote(msg, data)
+//    → TCP 回传 ClusterPacket（isResponse=true, sessionId）
+//    → ClusterGatewayActor::handleDecodedPacket
+//    → SendByName(targetActorName) 路由到本地调用方
+//    → CoroutineActor::OnMessage 检测 isResponse → ResumeWaiting
+//    → 协程恢复 → await_resume() 返回响应
+// ================================================================
+
+void ClusterCallAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    // 1. 分配 sessionId
+    sessionId = actor->AllocSession();
+
+    // 2. 存储协程句柄（等待恢复）
+    actor->StoreWaiting(sessionId, h);
+
+    // 3. 设置消息的 sessionId，通过 SendToRemote 发送到远端节点
+    msg.sessionId = sessionId;
+    // SendToRemote 是 Actor 的 protected 方法，ClusterCallAwaiter 是 CoroutineActor 的 friend
+    actor->SendToRemote(targetNodeId, targetActorName, std::move(msg));
+
+    // 4. 返回后协程挂起，worker 线程释放
+    //    远端 Actor 处理后调用 RespondRemote()，响应通过 TCP 返回
+    //    ClusterGatewayActor 解码后 SendByName 路由到本 Actor 的邮箱
+    //    OnMessage 检测 isResponse → ResumeWaiting → 协程恢复
+}
+
+ActorMessage ClusterCallAwaiter::await_resume()
+{
+    // 从 responseMap_ 取出响应消息（与 CallAwaiter::await_resume 完全相同）
     auto it = actor->responseMap_.find(sessionId);
     ActorMessage result;
     if (it != actor->responseMap_.end()) {

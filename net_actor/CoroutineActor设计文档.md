@@ -23,6 +23,7 @@
 - [十九、优先级消息 — 双队列邮箱](#十九优先级消息--双队列邮箱)
 - [二十、跨进程集群基础 — ClusterProxy](#二十跨进程集群基础--clusterproxy)
 - [二十一、高级特性测试用例说明](#二十一高级特性测试用例说明)
+- [二十二、协程挂起与唤醒的完整调用链路](#二十二协程挂起与唤醒的完整调用链路)
 - [附录 A：架构完善性分析 — 现有框架的不足与改进方向](#附录-a架构完善性分析--现有框架的不足与改进方向)
 
 ---
@@ -2552,9 +2553,189 @@ sys.RegisterTransport(&transport);  // 注册后 SendToRemote() 可用
 
 - **序列化优化**：`ClusterPacket.data` 改用 protobuf / flatbuffers 序列化
 - **节点发现**：通过心跳/注册中心自动发现节点
-- **跨进程 Call/Response**：基于 `sessionId` 实现 `co_await ClusterCall()`
+- ~~**跨进程 Call/Response**：基于 `sessionId` 实现 `co_await ClusterCall()`~~ ✅ 已实现（20.8 节）
 - **断线重连**：检测连接断开后自动重新建立
 - **负载均衡**：同一 Actor 名字在多个节点上注册，代理端做轮询/随机路由
+
+### 20.8 跨进程协程 RPC — co_await ClusterCall()
+
+#### 20.8.1 设计动机
+
+当 `CoroutineActor` 需要调用远端节点的服务时，期望获得与本地 `co_await Call()` 完全一致的编程体验：
+
+```cpp
+// 本地 RPC
+auto resp = co_await Call(localDbActorId,
+    ActorMessage{MsgType::UserMessage, 0, -1, "query:level"});
+
+// 跨进程 RPC — 写法几乎相同，体验一致！
+auto resp = co_await ClusterCall("nodeB", "db_service",
+    ActorMessage{MsgType::UserMessage, 0, -1, "query:level"});
+```
+
+#### 20.8.2 API 定义
+
+```cpp
+// CoroutineActor.h
+ClusterCallAwaiter ClusterCall(const std::string& targetNodeId,
+                                const std::string& targetActorName,
+                                ActorMessage&& msg);
+```
+
+| 参数 | 含义 |
+|------|------|
+| `targetNodeId` | 远端节点 ID（`TcpClusterTransport::SetLocalNodeId` 设置的标识） |
+| `targetActorName` | 远端 Actor 的注册名字（通过 `RegisterName` 注册） |
+| `msg` | 要发送的消息 |
+| **返回值** | `ClusterCallAwaiter`（可 `co_await`，恢复后返回 `ActorMessage` 响应） |
+
+**前提条件**：调用方 Actor **必须**已通过 `RegisterName()` 注册名字，否则远端无法将响应路由回来。
+
+#### 20.8.3 ClusterCallAwaiter 结构
+
+```cpp
+// Coroutine.h
+struct ClusterCallAwaiter
+{
+    CoroutineActor* actor;
+    std::string targetNodeId;
+    std::string targetActorName;
+    ActorMessage msg;
+    uint32_t sessionId = 0;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h);
+    ActorMessage await_resume();
+};
+```
+
+#### 20.8.4 完整数据流
+
+```
+  协程代码                     本地                      TCP                       远端
+  ───────                    ────                      ───                       ────
+  co_await ClusterCall(...)
+    │
+    ▼ await_suspend()
+    ├─ AllocSession() → sessionId=42
+    ├─ StoreWaiting(42, coroutine_handle)
+    ├─ msg.sessionId = 42
+    └─ SendToRemote("nodeB", "db_service", msg)
+         │
+         ▼ ActorSystem::SendToRemote()
+         ├─ senderName = GetActorName(actorId_)  ← 自动填充调用方名字
+         ├─ 构建 ClusterPacket:
+         │    sourceNodeId = "nodeA"
+         │    sourceActorName = "my_service"      ← 回程路由关键！
+         │    targetNodeId = "nodeB"
+         │    targetActorName = "db_service"
+         │    sessionId = 42
+         │    isResponse = false
+         └─ transport.SendPacket(pkt)
+              │
+              ▼ TCP 发送 ──────────────────────→ TCP 接收
+                                                   │
+                                                   ▼ ClusterGatewayActor::handleDecodedPacket()
+                                                   ├─ 构建 ActorMessage:
+                                                   │    sessionId = 42
+                                                   │    isResponse = false
+                                                   │    sourceNodeId = "nodeA"
+                                                   │    sourceActorName = "my_service"
+                                                   └─ SendByName("db_service", msg)
+                                                        │
+                                                        ▼ DbServiceActor::OnMessage()
+                                                        ├─ 处理请求
+                                                        └─ RespondRemote(msg, "level:42")
+                                                             │
+                                                             ▼ 构建 response:
+                                                             │   sessionId = 42
+                                                             │   isResponse = true
+                                                             └─ SendToRemote("nodeA", "my_service", resp)
+                                                                  │
+              TCP 接收 ←────────────────────── TCP 发送          │
+              │
+              ▼ ClusterGatewayActor::handleDecodedPacket()
+              ├─ 构建 ActorMessage:
+              │    sessionId = 42
+              │    isResponse = true   ← 关键标志！
+              └─ SendByName("my_service", msg)
+                   │
+                   ▼ CoroutineActor::OnMessage()
+                   ├─ 检测 isResponse=true && sessionId=42
+                   └─ ResumeWaiting(42, msg)
+                        ├─ waitMap_[42] → coroutine_handle
+                        ├─ responseMap_[42] = msg
+                        └─ handle.resume()
+                             │
+                             ▼ await_resume()
+                             └─ return responseMap_[42]  → "level:42"
+
+  // 协程在这里恢复！
+  std::cout << resp.data;  // 输出 "level:42"
+```
+
+#### 20.8.5 与本地 Call 的对比
+
+| 特性 | `Call()` | `ClusterCall()` |
+|------|----------|-----------------|
+| 寻址方式 | `actorId`（本地） | `nodeId` + `actorName`（跨进程） |
+| 发送路径 | `SendToActor()` | `SendToRemote()` → TCP |
+| 回复方式 | `Respond()` / `RespondToCall()` | `RespondRemote()` |
+| 协程挂起 | ✅ 完全相同 | ✅ 完全相同 |
+| 协程恢复 | ✅ `isResponse` + `sessionId` | ✅ 完全相同（相同机制） |
+| `await_resume()` | ✅ 从 `responseMap_` 取响应 | ✅ 完全相同 |
+| 前提条件 | 无 | 调用方必须 `RegisterName()` |
+| 性能 | 微秒级（进程内邮箱） | 毫秒级（TCP 往返） |
+
+#### 20.8.6 使用示例
+
+```cpp
+// ---- 节点 B（服务端）---- 远端服务 Actor（可以是普通 Actor！）
+class DbService : public Actor {
+    void OnMessage(ActorMessage& msg) override {
+        if (msg.IsRemote()) {
+            // 处理查询
+            std::string result = DoQuery(msg.data);
+            // 一行回复，自动路由回调用方
+            RespondRemote(msg, result);
+        }
+    }
+};
+sysB.RegisterName("db_service", sysB.RegisterActor(make_unique<DbService>()));
+
+// ---- 节点 A（客户端）---- 使用协程的服务
+class GameLogic : public CoroutineActor {
+    ActorTask OnCoroutineMessage(ActorMessage msg) override {
+        // 同步风格的跨进程 RPC！
+        auto dbResp = co_await ClusterCall("nodeB", "db_service",
+            ActorMessage{MsgType::UserMessage, 0, -1, "query:player_level"});
+
+        std::cout << "player level = " << dbResp.data << std::endl;
+
+        // 可以连续调用多个远端服务
+        auto mailResp = co_await ClusterCall("nodeC", "mail_service",
+            ActorMessage{MsgType::UserMessage, 0, -1, "get_unread_count"});
+
+        std::cout << "unread mails = " << mailResp.data << std::endl;
+
+        // 也可以混合使用本地和远程 Call
+        auto localResp = co_await Call(localCacheActorId,
+            ActorMessage{MsgType::UserMessage, 0, -1, "cache_update"});
+    }
+};
+auto gameId = sysA.RegisterActor(make_unique<GameLogic>());
+sysA.RegisterName("game_logic", gameId);  // 必须注册名字！
+```
+
+#### 20.8.7 注意事项
+
+1. **必须注册名字**：调用方 Actor 的名字通过 `RegisterName()` 注册后，`SendToRemote()` 内部自动通过 `GetActorName()` 填充 `sourceActorName`。如果未注册，远端无法将响应路由回来，协程将永久挂起。
+
+2. **超时风险**：跨进程 `ClusterCall()` 涉及网络传输，如果远端节点宕机或网络不可达，协程将永久挂起。生产环境建议实现 Call 超时机制（参考 15.3 节）。
+
+3. **sessionId 唯一性**：`sessionId` 由调用方 `CoroutineActor` 单调递增分配，在同一 Actor 内保证唯一。不同 Actor 的 `sessionId` 可能相同，但通过 `targetActorName` 路由到不同 Actor 的邮箱，不会混淆。
+
+4. **混合使用**：同一协程中可以自由混合 `Call()`、`ClusterCall()`、`Sleep()`，它们使用相同的 `sessionId` 和 `waitMap_` 机制，互不干扰。
 
 ---
 
@@ -2593,3 +2774,443 @@ SOURCES = test_advanced_features.cc \
 - Test6 (`TestTcpCluster`) 使用**真实 TCP 网络通信**，创建两套 EventLoop+ActorSystem 在 localhost 上通过 TCP 连接，验证完整的跨节点数据流。
 
 每个测试函数独立创建 `ActorSystem`，测试完成后调用 `Stop()` 清理，确保测试间互不干扰。
+
+---
+
+## 二十二、协程挂起与唤醒的完整调用链路
+
+本节以 **"服务 A（CoroutineActor）调用服务 B（CoroutineActor），B 执行异步操作后回复 A"** 为例，逐行追踪协程的挂起、调度、恢复全过程。
+
+### 22.1 场景描述
+
+```
+CallerServiceA                     AsyncServiceB                    DatabaseActor(普通Actor)
+     │                                  │                                │
+     ├─ co_await Call(B, request) ──────>│                                │
+     │  [A 的协程挂起]                   │                                │
+     │                                  ├─ co_await Sleep(50ms)          │
+     │                                  │  [B 的协程挂起]                │
+     │                                  │  ... 50ms 后 B 恢复 ...        │
+     │                                  ├─ co_await Call(C, query) ──────>│
+     │                                  │  [B 的协程再次挂起]            │
+     │                                  │                                ├─ 查询数据
+     │                                  │<──── RespondToCall(resp) ───────┤
+     │                                  │  [B 的协程恢复]                │
+     │                                  ├─ co_await Sleep(30ms)          │
+     │                                  │  [B 的协程挂起]                │
+     │                                  │  ... 30ms 后 B 恢复 ...        │
+     │                                  ├─ Respond(msg, result) ─────────>│
+     │  [A 的协程恢复]                   │                                │
+     │<──── result 返回 ────────────────┤                                │
+```
+
+### 22.2 阶段一：A 发起 Call 并挂起
+
+当 CallerServiceA 执行 `co_await Call(B_id, request)` 时：
+
+**步骤 1** — `CoroutineActor::Call()` 构造 `CallAwaiter`
+
+```
+文件: CoroutineActor.cc:62-65
+    CallAwaiter CoroutineActor::Call(uint32_t targetId, ActorMessage&& msg)
+    {
+        return CallAwaiter{this, targetId, std::move(msg)};
+    }
+```
+
+**步骤 2** — 编译器调用 `await_ready()` → 返回 `false`，必须挂起
+
+```
+文件: Coroutine.h:73
+    bool await_ready() const noexcept { return false; }
+```
+
+**步骤 3** — 编译器调用 `await_suspend(h)`，传入当前协程句柄 `h`
+
+```
+文件: CoroutineActor.cc:129-144
+    void CallAwaiter::await_suspend(std::coroutine_handle<> h)
+    {
+        // 1. 分配 sessionId（例如 sessionId=1）
+        sessionId = actor->AllocSession();       // CoroutineActor.h:114
+
+        // 2. 将 {sessionId=1 → 协程句柄h} 存入 waitMap_
+        actor->StoreWaiting(sessionId, h);        // CoroutineActor.cc:85-88
+
+        // 3. 设置消息的 sessionId，发送给目标 B
+        msg.sessionId = sessionId;
+        actor->SendToActor(targetId, std::move(msg));  // Actor.cc:80-86
+            // → msg.sourceId = A 的 actorId
+            // → system_->Send(B_id, msg)
+
+        // 4. 函数返回 → 协程挂起 → worker 线程释放
+    }
+```
+
+**此时 A 的状态**：
+- `waitMap_` 中有 `{sessionId=1 → 协程句柄h_A}`
+- A 的 `OnMessage()` 返回 → `ProcessOne()` 返回 → worker 线程可处理其他 Actor
+
+**步骤 4** — 消息进入 B 的邮箱
+
+```
+文件: ActorSystem.cc:137-157
+    void ActorSystem::Send(uint32_t actorId, ActorMessage&& msg)
+    {
+        actor->PushMessage(std::move(msg));       // 进入 B 的邮箱
+        // CAS scheduled_ false→true → readyQueue_.push(B_id) → cv_.notify_one()
+    }
+```
+
+### 22.3 阶段二：B 的异步处理过程
+
+Worker 线程从就绪队列取出 B_id，执行 B 的 `ProcessOne()`:
+
+```
+文件: ActorSystem.cc:450-474
+    void ActorSystem::workerLoop()
+    {
+        // readyQueue_.pop() → B_id
+        // actor = actors_[B_id]
+        actor->ProcessOne();                      // Actor.cc:35-67
+    }
+```
+
+**步骤 5** — `ProcessOne()` → `OnMessage(msg)`
+
+```
+文件: Actor.cc:35-49
+    bool Actor::ProcessOne()
+    {
+        auto opt = priorityMailbox_.pop();  // 或 normalMailbox_.pop()
+        OnMessage(*opt);                    // 多态调用 CoroutineActor::OnMessage
+        return true;
+    }
+```
+
+**步骤 6** — `CoroutineActor::OnMessage` 分发
+
+```
+文件: CoroutineActor.cc:47-59
+    void CoroutineActor::OnMessage(ActorMessage& msg)
+    {
+        if (msg.isResponse && msg.sessionId > 0) {
+            // 这是 Response → 恢复等待的协程
+            ResumeWaiting(msg.sessionId, std::move(msg));
+        } else {
+            // 新消息 → 创建新协程
+            OnCoroutineMessage(std::move(msg));  // ← 走这个分支
+        }
+    }
+```
+
+**步骤 7** — B 的 `OnCoroutineMessage` 开始执行（新建协程）
+
+```
+文件: 用户代码（示例 AsyncServiceB）
+    ActorTask AsyncServiceB::OnCoroutineMessage(ActorMessage msg) override
+    {
+        // msg 是按值传递 —— 在协程帧中有独立副本，安全跨 co_await
+
+        co_await Sleep(50);                     // B 的协程挂起 50ms
+
+        auto dbResp = co_await Call(C_id, ...); // B 向 C 发 Call → 再次挂起
+
+        co_await Sleep(30);                     // B 再次挂起 30ms
+
+        Respond(msg, result);                   // B 回复 A ← 关键步骤
+    }
+```
+
+> **关键**：`OnCoroutineMessage(ActorMessage msg)` 参数是**按值传递**。编译器会将 `msg` 拷贝到协程帧（heap-allocated coroutine frame）中。当协程执行 `co_await Sleep(50)` 后挂起，即使 `ProcessOne()` 返回了，`msg` 仍然存活在协程帧中。最后 `Respond(msg, result)` 使用的 `msg.sourceId` 和 `msg.sessionId` 值正确无误。
+
+### 22.4 阶段三：B 调用 Respond — 响应消息回传 A
+
+**步骤 8** — `CoroutineActor::Respond()`
+
+```
+文件: CoroutineActor.cc:74-78
+    void CoroutineActor::Respond(const ActorMessage& request, ActorMessage&& response)
+    {
+        RespondToCall(request, std::move(response));  // 委托给基类
+    }
+```
+
+**步骤 9** — `Actor::RespondToCall()` — 标记 Response 并回传
+
+```
+文件: Actor.cc:97-105
+    void Actor::RespondToCall(const ActorMessage& request, ActorMessage&& response)
+    {
+        response.sourceId  = actorId_;         // B 的 actorId
+        response.sessionId = request.sessionId; // 复制原请求的 sessionId（=1）
+        response.isResponse = true;             // ← 关键标记！
+        system_->Send(request.sourceId, std::move(response));
+        //                ↑ A 的 actorId（从原始请求的 sourceId 中获取）
+    }
+```
+
+> 这里 `request.sourceId` 就是 A 的 actorId —— 在步骤 3 中 `SendToActor()` 自动设置了 `msg.sourceId = A_actorId`。
+
+**步骤 10** — 响应消息进入 A 的邮箱
+
+```
+文件: ActorSystem.cc:137-157
+    void ActorSystem::Send(A_actorId, response)
+    {
+        // response = {sessionId=1, isResponse=true, sourceId=B_id, data=...}
+        actor_A->PushMessage(std::move(response));  // 进入 A 的邮箱
+        // CAS scheduled_ false→true → readyQueue_.push(A_id) → cv_.notify_one()
+    }
+```
+
+### 22.5 阶段四：Worker 线程处理 A 的响应消息
+
+**步骤 11** — Worker 线程从就绪队列取出 A_id
+
+```
+文件: ActorSystem.cc:450-474
+    void ActorSystem::workerLoop()
+    {
+        // readyQueue_.pop() → A_id
+        // actor = actors_[A_id]  → CallerServiceA*
+        actor->ProcessOne();
+    }
+```
+
+**步骤 12** — `ProcessOne()` 从邮箱取出响应消息
+
+```
+文件: Actor.cc:35-49
+    bool Actor::ProcessOne()
+    {
+        auto opt = normalMailbox_.pop();
+        // opt = {sessionId=1, isResponse=true, data="result_from_B"}
+        OnMessage(*opt);  // 多态调用 CoroutineActor::OnMessage
+        return true;
+    }
+```
+
+**步骤 13** — `CoroutineActor::OnMessage` 检测到 Response
+
+```
+文件: CoroutineActor.cc:47-59
+    void CoroutineActor::OnMessage(ActorMessage& msg)
+    {
+        if (msg.isResponse && msg.sessionId > 0) {  // ← 这次走这个分支！
+            ResumeWaiting(msg.sessionId, std::move(msg));
+        } else {
+            OnCoroutineMessage(std::move(msg));
+        }
+    }
+```
+
+### 22.6 阶段五：协程恢复
+
+**步骤 14** — `ResumeWaiting(sessionId=1, response)`
+
+```
+文件: CoroutineActor.cc:90-104
+    bool CoroutineActor::ResumeWaiting(uint32_t session, ActorMessage&& response)
+    {
+        auto it = waitMap_.find(session);     // 找到 sessionId=1 对应的协程句柄
+        if (it == waitMap_.end()) return false;
+
+        auto h = it->second;                  // h = 步骤3中存入的 h_A
+        waitMap_.erase(it);                   // 从等待映射中移除
+
+        responseMap_[session] = std::move(response);  // 存储响应数据
+        h.resume();                           // ← 恢复协程！从 co_await 处继续执行
+
+        return true;
+    }
+```
+
+**步骤 15** — `h.resume()` 触发 `CallAwaiter::await_resume()`
+
+```
+文件: CoroutineActor.cc:146-156
+    ActorMessage CallAwaiter::await_resume()
+    {
+        auto it = actor->responseMap_.find(sessionId);  // sessionId=1
+        ActorMessage result;
+        if (it != actor->responseMap_.end()) {
+            result = std::move(it->second);  // 取出 B 的响应数据
+            actor->responseMap_.erase(it);   // 清理
+        }
+        return result;  // ← 返回给 co_await Call() 的调用者
+    }
+```
+
+**步骤 16** — A 的协程从 `co_await` 处继续执行
+
+```
+文件: 用户代码（CallerServiceA）
+    ActorTask CallerServiceA::OnCoroutineMessage(ActorMessage msg) override
+    {
+        auto resp = co_await Call(B_id, request);
+        //                        ↑ 协程从这里恢复！resp 就是 B 的响应
+        // 继续执行后续逻辑...
+    }
+```
+
+### 22.7 完整数据流图（带 sessionId 追踪）
+
+```
+    ┌──────────────────────┐
+    │  CallerServiceA      │
+    │  (CoroutineActor)    │
+    │                      │
+    │  co_await Call(B,..) │
+    │    ↓                 │
+    │  CallAwaiter         │
+    │  ::await_suspend(h)  │
+    │    ├ sessionId = 1   │
+    │    ├ waitMap_[1] = h │
+    │    ├ msg.sessionId=1 │
+    │    ├ msg.sourceId=A  │
+    │    └ Send(B, msg) ───┼──────────── msg ──────────────────┐
+    │                      │           {session=1,              │
+    │  [协程挂起,          │            sourceId=A,             │
+    │   worker线程释放]    │            isResponse=false}       │
+    └──────────────────────┘                                    │
+                                                                ▼
+                                              ┌──────────────────────┐
+                                              │  AsyncServiceB       │
+                                              │  (CoroutineActor)    │
+                                              │                      │
+                                              │  OnMessage(msg)      │
+                                              │   isResponse=false   │
+                                              │   → OnCoroutineMsg() │
+                                              │                      │
+                                              │  co_await Sleep(50)  │
+                                              │  co_await Call(C,..) │
+                                              │  co_await Sleep(30)  │
+                                              │                      │
+                                              │  Respond(msg, resp)  │
+                                              │    ↓                 │
+                                              │  RespondToCall()     │
+                                              │    ├ resp.session=1  │
+                                              │    ├ resp.sourceId=B │
+                                              │    ├ resp.isResponse │
+                                              │    │    = true       │
+                                              │    └ Send(A, resp) ──┼──┐
+                                              └──────────────────────┘  │
+                                                                        │
+               resp {session=1, isResponse=true, data=...}              │
+    ┌───────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+    ┌──────────────────────┐
+    │  CallerServiceA      │
+    │  (CoroutineActor)    │
+    │                      │
+    │  OnMessage(resp)     │
+    │   isResponse=true    │
+    │   sessionId=1        │
+    │   → ResumeWaiting(1) │
+    │     ├ waitMap_[1]→h  │
+    │     ├ responseMap_[1]│
+    │     │   = resp       │
+    │     └ h.resume() ────┼──── 协程从 co_await 处恢复
+    │                      │
+    │  await_resume()      │
+    │    └ return resp     │
+    │                      │
+    │  auto resp = ...     │  ← co_await Call(B,..) 返回！
+    │  // 继续执行         │
+    └──────────────────────┘
+```
+
+### 22.8 关键数据结构
+
+| 数据结构 | 位置 | 作用 |
+|----------|------|------|
+| `waitMap_` | `CoroutineActor.h:124` | `unordered_map<uint32_t, coroutine_handle<>>` — sessionId 到挂起协程句柄的映射 |
+| `responseMap_` | `CoroutineActor.h:126` | `unordered_map<uint32_t, ActorMessage>` — sessionId 到响应消息的临时存储 |
+| `nextSessionId_` | `CoroutineActor.h:122` | `uint32_t` — 单调递增的 session 分配器 |
+| `msg.sessionId` | `Message.h` | `uint32_t` — 消息中携带的 session 标识，用于配对 Request/Response |
+| `msg.isResponse` | `Message.h` | `bool` — 标记消息是否是响应（`true` 时走恢复协程路径） |
+| `msg.sourceId` | `Message.h` | `uint32_t` — 发送方 actorId，用于 `RespondToCall()` 知道回复给谁 |
+
+### 22.9 线程安全分析
+
+整个调用链中 **没有任何加锁操作**（Actor 内部）：
+
+1. **A 的 `waitMap_` / `responseMap_`** —— 只在 A 的 `OnMessage()` 中读写。由于 Actor 邮箱串行处理保证，同一时刻只有一个 worker 线程在执行 A 的 `OnMessage()`，不存在并发访问。
+
+2. **B 的 `OnCoroutineMessage`** —— 同理，串行处理，无并发。
+
+3. **`ActorSystem::Send()`** —— 内部通过 `SpinLock` 保护 `actors_` 映射，`PushMessage()` 通过 `SpinLockQueue`（线程安全队列）入队，`scheduled_` 通过 CAS 操作保证原子性。这是唯一涉及跨线程的操作。
+
+4. **`h.resume()`** —— 在 A 的 `OnMessage()` 内调用，等于在当前 worker 线程上执行恢复后的协程代码。协程恢复后执行到 `co_return` 或下一个 `co_await`，全程仍在同一个 `ProcessOne()` 调用栈中。
+
+### 22.10 为什么 A 的协程能正确恢复？—— sessionId 配对机制
+
+```
+                    sessionId 生命周期
+                    ━━━━━━━━━━━━━━━━━
+
+  A: AllocSession()                      B: Respond(msg, resp)
+       │                                       │
+       ├─ sessionId = 1                        ├─ resp.sessionId = msg.sessionId (=1)
+       ├─ waitMap_[1] = h_A                    ├─ resp.isResponse = true
+       ├─ msg.sessionId = 1                    └─ Send(A, resp)
+       └─ Send(B, msg)                              │
+                                                     ▼
+                                               A: OnMessage(resp)
+                                                 resp.sessionId = 1  ← 与 waitMap_[1] 匹配！
+                                                 ResumeWaiting(1)
+                                                   → h_A.resume()
+```
+
+`sessionId` 是 **Request 和 Response 的唯一配对标识**：
+- 由发起方（A）分配，全 Actor 内唯一（`nextSessionId_++`）
+- 随 Request 消息传递给 B（`msg.sessionId = 1`）
+- B 回复时原样带回（`response.sessionId = request.sessionId`）
+- A 收到 Response 时，根据 `sessionId` 找到对应的挂起协程句柄
+
+### 22.11 并发多协程场景
+
+同一个 Actor 可以同时有多个协程挂起（类似 Skynet 的多 session）：
+
+```
+A 的 waitMap_ 状态变化：
+
+  msg1 到达 → 创建协程1 → co_await Call(B, ...) → waitMap_ = {1: h1}
+  msg2 到达 → 创建协程2 → co_await Call(C, ...) → waitMap_ = {1: h1, 2: h2}
+  msg3 到达 → 创建协程3 → co_await Sleep(100)   → waitMap_ = {1: h1, 2: h2, 3: h3}
+  
+  C 回复(session=2) → ResumeWaiting(2) → h2.resume() → waitMap_ = {1: h1, 3: h3}
+  Sleep到期(session=3) → ResumeWaiting(3) → h3.resume() → waitMap_ = {1: h1}
+  B 回复(session=1) → ResumeWaiting(1) → h1.resume() → waitMap_ = {}
+```
+
+但同一时刻只有一个协程在执行（邮箱串行处理保证）。多个协程的 **挂起** 是并行的，**执行** 是串行的。
+
+### 22.12 对应测试用例
+
+**Test6** (`test_coroutine_actor.cc`) 完整验证了上述流程：
+
+```cpp
+// CallerServiceA: 发起 Call 并等待
+ActorTask CallerServiceA::OnCoroutineMessage(ActorMessage msg) override {
+    auto resp = co_await Call(targetBId_, ActorMessage{..., "request_from_A"});
+    // 验证 resp.data 包含 B 的异步处理结果
+    result_.store(resp.data);
+    done_.store(true);
+}
+
+// AsyncServiceB: 执行多步异步操作后回复
+ActorTask AsyncServiceB::OnCoroutineMessage(ActorMessage msg) override {
+    co_await Sleep(50);                    // 模拟异步等待
+    auto dbResp = co_await Call(dbId_, ...); // 调用第三方服务
+    co_await Sleep(30);                    // 再次异步等待
+    Respond(msg, ActorMessage{..., result}); // 回复 A
+}
+```
+
+测试验证：
+- A 的协程确实被正确恢复（`done_.load() == true`）
+- 响应数据正确传回（包含 DB 查询结果）
+- 总耗时 ≥ 60ms（Sleep(50) + Sleep(30) 的累计）

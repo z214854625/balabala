@@ -10,13 +10,14 @@
      - 如果是新消息 → 调用 OnCoroutineMessage() 创建新协程
   
   2. OnCoroutineMessage() 是用户重写的协程函数（返回 ActorTask）：
-     - 可以使用 co_await Call(targetId, msg) 发送消息并等待响应
+     - 可以使用 co_await Call(targetId, msg) 发送消息并等待响应（本地RPC）
+     - 可以使用 co_await ClusterCall(nodeId, name, msg) 跨进程RPC
      - 可以使用 co_await Sleep(ms) 休眠
      - 挂起时 worker 线程释放，可处理其他 Actor
   
   3. 多个协程可以在同一个 Actor 上并发挂起（类似 Skynet）：
      - 消息 A 到达 → 创建协程 A → co_await Call → 挂起
-     - 消息 B 到达 → 创建协程 B → co_await Call → 挂起
+     - 消息 B 到达 → 创建协程 B → co_await ClusterCall → 挂起
      - 响应 A 到达 → 恢复协程 A → 继续执行
      - 响应 B 到达 → 恢复协程 B → 继续执行
      但同一时刻只有一个协程在运行（邮箱串行处理保证）
@@ -26,19 +27,31 @@
        在 ActorSystem::Stop() 排空邮箱后，销毁所有悬挂的协程帧，防止内存泄漏。
   [P0] A.3 Sleep() 改用 TimerManager：
        不再启动 detached thread，而是通过 ActorSystem::SetTimeout() 注册定时器。
+  [P3] ClusterCall() — 跨进程协程RPC：
+       通过 SendToRemote() 发送请求到远端节点，协程挂起等待远端 RespondRemote() 回复。
+       调用方 Actor 必须已注册名字（RegisterName），否则远端无法路由响应。
 
-使用示例：
+使用示例（本地RPC）：
   class MyService : public CoroutineActor {
       ActorTask OnCoroutineMessage(ActorMessage msg) override {
-          // 同步风格的异步代码！
           auto resp = co_await Call(dbActorId,
               ActorMessage{MsgType::UserMessage, 0, -1, "get:player_level"});
           std::cout << "level = " << resp.data << std::endl;
           
           co_await Sleep(100);  // 休眠 100ms
           
-          // 可以 Respond 给调用者（如果有人 Call 了我们）
           Respond(msg, ActorMessage{MsgType::UserMessage, 0, -1, "done"});
+      }
+  };
+
+使用示例（跨进程RPC）：
+  class CrossNodeService : public CoroutineActor {
+      ActorTask OnCoroutineMessage(ActorMessage msg) override {
+          // 跨进程调用远端节点的 "db_service"，协程挂起等待响应！
+          auto resp = co_await ClusterCall("nodeB", "db_service",
+              ActorMessage{MsgType::UserMessage, 0, -1, "query:player_data"});
+          std::cout << "remote result = " << resp.data << std::endl;
+          // 协程在这里恢复，和本地 Call() 体验完全一致
       }
   };
 */
@@ -54,6 +67,7 @@ class CoroutineActor : public Actor
 {
     // Awaiter 需要访问内部方法
     friend struct CallAwaiter;
+    friend struct ClusterCallAwaiter;
     friend struct SleepAwaiter;
 
 public:
@@ -70,11 +84,18 @@ public:
 
     // ===== Skynet 风格 API =====
 
-    // 类似 skynet.call()：发送消息并等待响应
+    // 类似 skynet.call()：发送消息并等待响应（本地RPC）
     // 用法: auto resp = co_await Call(targetId, msg);
     CallAwaiter Call(uint32_t targetId, ActorMessage&& msg);
 
-    // 类似 skynet.ret()：响应一个 Call 请求
+    // 类似 skynet cluster.call()：跨进程发送消息并等待响应（跨进程RPC）
+    // 注意：调用方 Actor 必须已通过 RegisterName() 注册名字！
+    // 用法: auto resp = co_await ClusterCall("nodeB", "db_service", msg);
+    ClusterCallAwaiter ClusterCall(const std::string& targetNodeId,
+                                   const std::string& targetActorName,
+                                   ActorMessage&& msg);
+
+    // 类似 skynet.ret()：响应一个 Call 请求（本地）
     // 用法: Respond(originalMsg, responseMsg);
     void Respond(const ActorMessage& request, ActorMessage&& response);
 

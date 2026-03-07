@@ -539,6 +539,209 @@ bool Test5_Integration()
 }
 
 // ============================================================
+//  Test6: 服务A协程调用服务B的异步函数，B做异步操作后回复A
+//
+//  这是用户问的核心场景：
+//    服务A (CoroutineActor) 通过 co_await Call 调用服务B
+//    → A 挂起等待
+//    → 服务B (CoroutineActor) 收到请求后不立即回复
+//    → B 先 co_await Sleep(50ms) 模拟异步处理
+//    → B 再 co_await Call(C) 查询数据库
+//    → B 组合结果后 Respond(msg, result) 回复A
+//    → A 收到回复，恢复执行
+//
+//  关键设计保证：
+//    OnCoroutineMessage(ActorMessage msg) 按值传递
+//    → msg 存在协程帧中，B 的 co_await 后 msg 仍有效
+//    → Respond(msg, ...) 可以安全读取 msg.sessionId 和 msg.sourceId
+// ============================================================
+
+// 服务C: 数据库查询（普通 Actor，同步响应）
+class DataQueryActor : public Actor
+{
+public:
+    std::atomic<int> queryCount{0};
+
+    void OnMessage(ActorMessage& msg) override
+    {
+        if (msg.type != MsgType::UserMessage) return;
+        queryCount.fetch_add(1);
+
+        // 模拟数据库查询
+        std::string result = "db_result_for_" + msg.data;
+        std::cout << "[DataQueryActor] query: " << msg.data
+                  << " → " << result << std::endl;
+        RespondToCall(msg, ActorMessage{MsgType::UserMessage, 0, -1, result});
+    }
+};
+
+// 服务B: 异步服务（CoroutineActor，内部做 Sleep + Call 等异步操作）
+class AsyncServiceB : public CoroutineActor
+{
+public:
+    uint32_t dataQueryActorId = 0;
+    std::atomic<int> processCount{0};
+
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
+    {
+        std::cout << "[ServiceB] 收到请求: " << msg.data
+                  << " (session=" << msg.sessionId
+                  << ", from=" << msg.sourceId << ")" << std::endl;
+
+        if (msg.data.find("async_process:") == 0) {
+            std::string payload = msg.data.substr(14);
+
+            // ① 先做一些异步处理（Sleep 模拟耗时操作）
+            std::cout << "[ServiceB] 开始异步处理，先 Sleep 50ms..." << std::endl;
+            co_await Sleep(50);
+            std::cout << "[ServiceB] Sleep 完成，继续处理..." << std::endl;
+
+            // ② 调用服务C查询数据（co_await Call → 挂起等待C回复）
+            std::cout << "[ServiceB] 调用 DataQueryActor 查询数据..." << std::endl;
+            auto dbResp = co_await Call(dataQueryActorId,
+                ActorMessage{MsgType::UserMessage, 0, -1, payload});
+            std::cout << "[ServiceB] DataQueryActor 返回: " << dbResp.data << std::endl;
+
+            // ③ 再 Sleep 一下模拟后处理
+            co_await Sleep(30);
+
+            // ④ 组合最终结果
+            std::string finalResult = "processed:" + dbResp.data;
+            processCount.fetch_add(1);
+            std::cout << "[ServiceB] 异步处理完毕! 结果: " << finalResult << std::endl;
+
+            // ⑤ 回复服务A —— 关键：msg 在协程帧中仍然有效！
+            //    msg.sessionId 和 msg.sourceId 正确指向 A 的等待协程
+            Respond(msg, ActorMessage{MsgType::UserMessage, 0, -1, finalResult});
+        }
+    }
+};
+
+// 服务A: 发起调用（CoroutineActor，co_await Call 调用 B）
+class CallerServiceA : public CoroutineActor
+{
+public:
+    uint32_t serviceBId = 0;
+    std::atomic<bool> done{false};
+    std::string result;
+    int64_t elapsedMs = 0;
+
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
+    {
+        if (msg.data == "start") {
+            std::cout << "[ServiceA] 发起 co_await Call(ServiceB, ...)" << std::endl;
+            auto start = std::chrono::steady_clock::now();
+
+            // ===== 核心: 协程挂起等待 B 的异步函数执行完毕 =====
+            auto resp = co_await Call(serviceBId,
+                ActorMessage{MsgType::UserMessage, 0, -1, "async_process:player_data"});
+
+            elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+            result = resp.data;
+            done.store(true);
+            std::cout << "[ServiceA] 收到 B 的回复: " << result
+                      << " (耗时 " << elapsedMs << "ms)" << std::endl;
+        }
+    }
+};
+
+bool Test6_AsyncServiceCall()
+{
+    std::cout << "\n========== Test6: 服务A调用协程服务B的异步函数 ==========" << std::endl;
+    std::cout << "  ServiceA (co_await Call) → ServiceB (Sleep + Call C + Respond) → A 恢复" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  数据流:" << std::endl;
+    std::cout << "    A: co_await Call(B, \"async_process:player_data\")" << std::endl;
+    std::cout << "       → A 协程挂起" << std::endl;
+    std::cout << "    B: co_await Sleep(50ms)" << std::endl;
+    std::cout << "       → B 协程挂起 → 50ms后恢复" << std::endl;
+    std::cout << "    B: co_await Call(C, \"player_data\")" << std::endl;
+    std::cout << "       → B 协程挂起 → C 回复后恢复" << std::endl;
+    std::cout << "    B: co_await Sleep(30ms)" << std::endl;
+    std::cout << "       → B 协程挂起 → 30ms后恢复" << std::endl;
+    std::cout << "    B: Respond(msg, result)  ← msg 在协程帧中仍有效!" << std::endl;
+    std::cout << "       → A 收到回复，协程恢复继续执行" << std::endl;
+    std::cout << std::endl;
+
+    ActorSystem sys;
+    sys.Start(4, nullptr);
+
+    // 创建服务C（数据库查询 — 普通 Actor）
+    auto cPtr = std::make_unique<DataQueryActor>();
+    DataQueryActor* serviceC = cPtr.get();
+    uint32_t cId = sys.RegisterActor(std::move(cPtr));
+
+    // 创建服务B（异步服务 — CoroutineActor）
+    auto bPtr = std::make_unique<AsyncServiceB>();
+    AsyncServiceB* serviceB = bPtr.get();
+    bPtr->dataQueryActorId = cId;
+    uint32_t bId = sys.RegisterActor(std::move(bPtr));
+
+    // 创建服务A（调用方 — CoroutineActor）
+    auto aPtr = std::make_unique<CallerServiceA>();
+    CallerServiceA* serviceA = aPtr.get();
+    aPtr->serviceBId = bId;
+    uint32_t aId = sys.RegisterActor(std::move(aPtr));
+
+    // 触发调用
+    sys.Send(aId, ActorMessage{MsgType::UserMessage, 0, -1, "start"});
+
+    // 等待A完成（B需要 Sleep(50) + Call(C) + Sleep(30)，总计至少80ms）
+    bool ok = WaitFor(serviceA->done, 10000);
+
+    if (ok) {
+        // 验证结果
+        if (serviceA->result == "processed:db_result_for_player_data") {
+            std::cout << "[PASS] 服务A成功收到B的异步处理结果: " << serviceA->result << std::endl;
+        } else {
+            std::cout << "[FAIL] 结果不匹配: " << serviceA->result
+                      << ", 期望: processed:db_result_for_player_data" << std::endl;
+            ok = false;
+        }
+
+        // 验证耗时（至少80ms = Sleep(50) + Sleep(30)）
+        if (serviceA->elapsedMs >= 60) {  // 允许一些定时器误差
+            std::cout << "[PASS] 耗时 " << serviceA->elapsedMs
+                      << "ms (>= 60ms，包含B的异步等待时间)" << std::endl;
+        } else {
+            std::cout << "[FAIL] 耗时太短: " << serviceA->elapsedMs
+                      << "ms，说明B的异步操作没有正确执行" << std::endl;
+            ok = false;
+        }
+
+        // 验证B处理了1次
+        if (serviceB->processCount.load() != 1) {
+            std::cout << "[FAIL] ServiceB processCount=" << serviceB->processCount.load()
+                      << ", expected=1" << std::endl;
+            ok = false;
+        }
+
+        // 验证C被查询了1次
+        if (serviceC->queryCount.load() != 1) {
+            std::cout << "[FAIL] DataQueryActor queryCount=" << serviceC->queryCount.load()
+                      << ", expected=1" << std::endl;
+            ok = false;
+        }
+    } else {
+        std::cout << "[FAIL] 超时! 服务A未收到B的回复" << std::endl;
+    }
+
+    sys.Stop();
+
+    if (ok) {
+        std::cout << std::endl;
+        std::cout << "  ✓ 核心验证: 服务A通过协程调用了服务B的异步函数" << std::endl;
+        std::cout << "  ✓ 服务B内部做了 Sleep + Call(C) + Sleep 三次异步操作" << std::endl;
+        std::cout << "  ✓ B完成后通过 Respond(msg, ...) 回复A（msg在协程帧中有效）" << std::endl;
+        std::cout << "  ✓ A的协程在收到B回复后自动恢复，继续执行后续逻辑" << std::endl;
+    }
+
+    return ok;
+}
+
+// ============================================================
 //  main
 // ============================================================
 int main()
@@ -562,6 +765,7 @@ int main()
     if (Test3_ConcurrentCoroutines())  ++passed; else ++failed;
     if (Test4_ChainCall())             ++passed; else ++failed;
     if (Test5_Integration())           ++passed; else ++failed;
+    if (Test6_AsyncServiceCall())      ++passed; else ++failed;
 
     std::cout << "\n==================================================" << std::endl;
     std::cout << "  Result: " << passed << " passed, " << failed << " failed" << std::endl;
@@ -574,6 +778,7 @@ int main()
         std::cout << "  3. 响应到达时自动恢复协程，代码看起来完全同步" << std::endl;
         std::cout << "  4. 同一 Actor 上多个协程可以交错执行（类似 Skynet）" << std::endl;
         std::cout << "  5. 链式 Call 自然支持：A → B → C → 响应逐层返回" << std::endl;
+        std::cout << "  6. 服务A co_await Call(B)，B做异步操作后Respond回A — 天然支持" << std::endl;
     }
 
     std::cout << "==================================================" << std::endl;
