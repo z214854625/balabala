@@ -16,6 +16,9 @@
 #include "precompiled.h"
 #include "Actor.h"
 #include "ActorSystem.h"
+#include "EventLoop.h"
+#include "Acceptor.h"
+#include "Connector.h"
 #include "Message.h"
 #include "ClusterProxy.h"
 
@@ -624,6 +627,323 @@ bool TestCollectActorStats()
 }
 
 // ================================================================
+//  Test7: TcpClusterTransport 真实 TCP 跨节点通信
+//
+//  架构：
+//    Node A (EventLoop + ActorSystem)    Node B (EventLoop + ActorSystem)
+//     ├── SenderActor                     ├── ReceiverActor (name="remote_svc")
+//     ├── ClusterProxy("nodeB","remote_svc")  ├── ClusterGatewayActor (内部)
+//     └── TcpClusterTransport             └── TcpClusterTransport
+//          └── Connector ─── TCP ──── Acceptor
+//
+//  数据流：
+//    SenderActor → ClusterProxy → TcpClusterTransport(nodeA)
+//      → TCP → ClusterGatewayActor(nodeB) → ReceiverActor
+//
+//  同时测试双向通信：
+//    NodeB 的 ReceiverActor → ClusterProxy("nodeA","ack_svc")
+//      → TCP → ClusterGatewayActor(nodeA) → AckActor(nodeA)
+// ================================================================
+
+static const int TCP_CLUSTER_PORT_B = 19700;  // 节点 B 监听端口
+static const int TCP_CLUSTER_PORT_A = 19701;  // 节点 A 监听端口（用于反向连接）
+
+// 节点 B 上的接收 Actor
+class TcpReceiverActor : public Actor
+{
+public:
+    std::atomic<int> recvCount{0};
+    std::atomic<bool> allReceived{false};
+    int expectedCount = 0;
+
+    // 用于反向回复的 transport 和远程 proxy
+    IClusterTransport* transport = nullptr;
+    std::string ackNodeId;
+    std::string ackActorName;
+
+    void OnMessage(ActorMessage& msg) override
+    {
+        if (msg.type != MsgType::UserMessage) return;
+        int cnt = recvCount.fetch_add(1) + 1;
+        std::cout << "  [TcpReceiverActor] recv #" << cnt << ": " << msg.data << std::endl;
+
+        // 发送确认回执给节点 A（通过 transport 反向发送）
+        if (transport && !ackNodeId.empty() && !ackActorName.empty()) {
+            ClusterPacket ackPkt;
+            ackPkt.sourceNodeId = transport->GetLocalNodeId();
+            ackPkt.targetNodeId = ackNodeId;
+            ackPkt.sourceActorId = GetActorId();
+            ackPkt.targetActorName = ackActorName;
+            ackPkt.data = "ack:" + msg.data;
+            transport->SendPacket(ackPkt);
+        }
+
+        if (cnt >= expectedCount) {
+            allReceived.store(true);
+        }
+    }
+};
+
+// 节点 A 上的确认接收 Actor（接收反向回复）
+class TcpAckActor : public Actor
+{
+public:
+    std::atomic<int> ackCount{0};
+    std::atomic<bool> allAcked{false};
+    int expectedCount = 0;
+
+    void OnMessage(ActorMessage& msg) override
+    {
+        if (msg.type != MsgType::UserMessage) return;
+        int cnt = ackCount.fetch_add(1) + 1;
+        std::cout << "  [TcpAckActor] recv ack #" << cnt << ": " << msg.data << std::endl;
+        if (cnt >= expectedCount) {
+            allAcked.store(true);
+        }
+    }
+};
+
+bool TestTcpCluster()
+{
+    std::cout << "\n========== Test7: TcpClusterTransport (Real TCP) ==========" << std::endl;
+    std::cout << "  Testing real cross-node TCP communication..." << std::endl;
+
+    const int MSG_COUNT = 5;
+
+    // -------------------------------------------------------
+    //  1. 启动节点 B（接收端）
+    // -------------------------------------------------------
+    std::cout << "\n  [Setup] Starting Node B (receiver)..." << std::endl;
+
+    EventLoop loopB;
+    loopB.Create();
+    ActorSystem sysB;
+    sysB.Start(4, &loopB);
+    loopB.SetActorSystem(&sysB);
+
+    // 创建 TcpClusterTransport（内部自动注册 ClusterGatewayActor）
+    TcpClusterTransport transportB(&sysB, &loopB);
+    transportB.SetLocalNodeId("nodeB");
+    transportB.Listen(TCP_CLUSTER_PORT_B);
+
+    // 注册接收 Actor
+    auto recvPtr = std::make_unique<TcpReceiverActor>();
+    TcpReceiverActor* receiver = recvPtr.get();
+    receiver->expectedCount = MSG_COUNT;
+    receiver->transport = &transportB;
+    receiver->ackNodeId = "nodeA";
+    receiver->ackActorName = "ack_service";
+    uint32_t receiverId = sysB.RegisterActor(std::move(recvPtr));
+    sysB.RegisterName("remote_svc", receiverId);
+
+    std::cout << "  [Setup] Node B: listening on port " << TCP_CLUSTER_PORT_B
+              << ", ReceiverActor(id=" << receiverId << ", name=remote_svc)" << std::endl;
+
+    usleep(100000);  // 100ms 等待监听就绪
+
+    // -------------------------------------------------------
+    //  2. 启动节点 A（发送端）
+    // -------------------------------------------------------
+    std::cout << "  [Setup] Starting Node A (sender)..." << std::endl;
+
+    EventLoop loopA;
+    loopA.Create();
+    ActorSystem sysA;
+    sysA.Start(4, &loopA);
+    loopA.SetActorSystem(&sysA);
+
+    TcpClusterTransport transportA(&sysA, &loopA);
+    transportA.SetLocalNodeId("nodeA");
+    transportA.Listen(TCP_CLUSTER_PORT_A);  // 节点 A 也监听（用于接收反向连接）
+
+    // 注册 AckActor（接收节点 B 的确认回复）
+    auto ackPtr = std::make_unique<TcpAckActor>();
+    TcpAckActor* ackActor = ackPtr.get();
+    ackActor->expectedCount = MSG_COUNT;
+    uint32_t ackId = sysA.RegisterActor(std::move(ackPtr));
+    sysA.RegisterName("ack_service", ackId);
+
+    // 节点 A 连接到节点 B
+    transportA.ConnectToNode("nodeB", "127.0.0.1", TCP_CLUSTER_PORT_B);
+
+    std::cout << "  [Setup] Node A: connecting to nodeB (127.0.0.1:" << TCP_CLUSTER_PORT_B << ")"
+              << std::endl;
+
+    // 等待连接和握手完成
+    usleep(500000);  // 500ms
+
+    // 节点 B 连接到节点 A（用于反向发送）
+    transportB.ConnectToNode("nodeA", "127.0.0.1", TCP_CLUSTER_PORT_A);
+
+    // 等待反向连接和握手完成
+    usleep(500000);  // 500ms
+
+    // -------------------------------------------------------
+    //  3. 验证连接建立
+    // -------------------------------------------------------
+    int fdToB = transportA.GetFdByNodeId("nodeB");
+    if (fdToB < 0) {
+        std::cout << "  [FAIL] Node A cannot find fd for nodeB! Handshake may have failed." << std::endl;
+        sysA.Stop();
+        sysB.Stop();
+        return false;
+    }
+    std::cout << "  [Setup] Connection established: nodeA -> nodeB, fd=" << fdToB << std::endl;
+
+    // -------------------------------------------------------
+    //  4. 创建 ClusterProxy 并发送消息
+    // -------------------------------------------------------
+    RemoteActorRef remoteRef("nodeB", "remote_svc");
+    auto proxyPtr = std::make_unique<ClusterProxy>(remoteRef, &transportA);
+    uint32_t proxyId = sysA.RegisterActor(std::move(proxyPtr));
+
+    std::cout << "  [Test] Sending " << MSG_COUNT << " messages via TCP ClusterProxy..." << std::endl;
+
+    for (int i = 0; i < MSG_COUNT; ++i) {
+        ActorMessage msg{MsgType::UserMessage, 0, -1,
+                         "tcp_cluster_msg_" + std::to_string(i)};
+        sysA.Send(proxyId, std::move(msg));
+        usleep(10000);  // 10ms 间隔
+    }
+
+    // -------------------------------------------------------
+    //  5. 等待接收和确认
+    // -------------------------------------------------------
+    std::cout << "  [Test] Waiting for Node B to receive messages..." << std::endl;
+
+    bool recvOk = WaitFor(receiver->allReceived, 5000);
+    if (!recvOk) {
+        std::cout << "  [WARN] Receiver timeout, got " << receiver->recvCount.load()
+                  << "/" << MSG_COUNT << std::endl;
+    }
+
+    std::cout << "  [Test] Waiting for ack responses from Node B..." << std::endl;
+
+    bool ackOk = WaitFor(ackActor->allAcked, 5000);
+    if (!ackOk) {
+        std::cout << "  [WARN] Ack timeout, got " << ackActor->ackCount.load()
+                  << "/" << MSG_COUNT << std::endl;
+    }
+
+    // -------------------------------------------------------
+    //  6. 验证结果
+    // -------------------------------------------------------
+    bool ok = true;
+
+    int recvCount = receiver->recvCount.load();
+    int ackCount = ackActor->ackCount.load();
+
+    std::cout << "\n  [Verify] Results:" << std::endl;
+    std::cout << "    Node B ReceiverActor: " << recvCount << "/" << MSG_COUNT << " received" << std::endl;
+    std::cout << "    Node A AckActor: " << ackCount << "/" << MSG_COUNT << " acks" << std::endl;
+
+    if (recvCount < MSG_COUNT) {
+        std::cout << "  [FAIL] ReceiverActor recvCount=" << recvCount
+                  << ", expected=" << MSG_COUNT << std::endl;
+        ok = false;
+    }
+
+    if (ackCount < MSG_COUNT) {
+        std::cout << "  [FAIL] AckActor ackCount=" << ackCount
+                  << ", expected=" << MSG_COUNT << std::endl;
+        ok = false;
+    }
+
+    // 验证 ClusterPacketCodec 的编解码一致性
+    {
+        ClusterPacket testPkt;
+        testPkt.sourceNodeId = "test_node_A";
+        testPkt.targetNodeId = "test_node_B";
+        testPkt.sourceActorId = 42;
+        testPkt.targetActorId = 99;
+        testPkt.targetActorName = "my_service";
+        testPkt.sessionId = 12345;
+        testPkt.isResponse = true;
+        testPkt.data = "hello codec test!";
+
+        std::string encoded = ClusterPacketCodec::Encode(testPkt);
+        ClusterPacket decoded;
+        size_t consumed = ClusterPacketCodec::Decode(encoded.data(), encoded.size(), decoded);
+
+        if (consumed != encoded.size()) {
+            std::cout << "  [FAIL] Codec roundtrip: consumed=" << consumed
+                      << ", encoded.size()=" << encoded.size() << std::endl;
+            ok = false;
+        }
+        if (decoded.sourceNodeId != testPkt.sourceNodeId ||
+            decoded.targetNodeId != testPkt.targetNodeId ||
+            decoded.sourceActorId != testPkt.sourceActorId ||
+            decoded.targetActorId != testPkt.targetActorId ||
+            decoded.targetActorName != testPkt.targetActorName ||
+            decoded.sessionId != testPkt.sessionId ||
+            decoded.isResponse != testPkt.isResponse ||
+            decoded.data != testPkt.data)
+        {
+            std::cout << "  [FAIL] Codec roundtrip: decoded data mismatch!" << std::endl;
+            ok = false;
+        } else {
+            std::cout << "    ClusterPacketCodec roundtrip: OK" << std::endl;
+        }
+
+        // 测试部分包检测
+        size_t partial = ClusterPacketCodec::Decode(encoded.data(), 3, decoded);
+        if (partial != 0) {
+            std::cout << "  [FAIL] Codec partial detection failed!" << std::endl;
+            ok = false;
+        } else {
+            std::cout << "    ClusterPacketCodec partial detection: OK" << std::endl;
+        }
+
+        // 测试粘包：两个包拼在一起
+        std::string doubled = encoded + encoded;
+        ClusterPacket d1, d2;
+        size_t c1 = ClusterPacketCodec::Decode(doubled.data(), doubled.size(), d1);
+        size_t c2 = ClusterPacketCodec::Decode(doubled.data() + c1, doubled.size() - c1, d2);
+        if (c1 == 0 || c2 == 0 || c1 + c2 != doubled.size()) {
+            std::cout << "  [FAIL] Codec sticky packet detection failed!" << std::endl;
+            ok = false;
+        } else {
+            std::cout << "    ClusterPacketCodec sticky packet: OK (2 packets decoded)" << std::endl;
+        }
+    }
+
+    // 验证已知节点列表
+    {
+        auto nodes = transportA.GetKnownNodes();
+        bool foundNodeB = false;
+        for (const auto& n : nodes) {
+            if (n.nodeId == "nodeB") {
+                foundNodeB = true;
+                if (!n.alive) {
+                    std::cout << "  [WARN] nodeB not marked alive in knownNodes" << std::endl;
+                }
+            }
+        }
+        if (!foundNodeB) {
+            std::cout << "  [FAIL] nodeB not found in knownNodes!" << std::endl;
+            ok = false;
+        } else {
+            std::cout << "    KnownNodes: nodeB found, alive=" << (foundNodeB ? "yes" : "no") << std::endl;
+        }
+    }
+
+    // -------------------------------------------------------
+    //  7. 清理
+    // -------------------------------------------------------
+    sysA.Stop();
+    sysB.Stop();
+
+    if (ok) {
+        std::cout << "[PASS] TcpCluster: " << recvCount << " msgs sent via TCP,"
+                  << " " << ackCount << " acks received (bidirectional)" << std::endl;
+        std::cout << "  Data flow:" << std::endl;
+        std::cout << "    NodeA.ClusterProxy → TCP → NodeB.ReceiverActor (forward)" << std::endl;
+        std::cout << "    NodeB.ReceiverActor → TCP → NodeA.AckActor (reverse)" << std::endl;
+    }
+    return ok;
+}
+
+// ================================================================
 //  main
 // ================================================================
 
@@ -632,7 +952,7 @@ int main()
     std::cout << "======================================" << std::endl;
     std::cout << "  Advanced Features Test Suite" << std::endl;
     std::cout << "  (P2/P3: Payload, Priority, Metrics," << std::endl;
-    std::cout << "   Cluster, Stats)" << std::endl;
+    std::cout << "   Cluster, Stats, TcpCluster)" << std::endl;
     std::cout << "======================================" << std::endl;
 
     int passed = 0;
@@ -643,6 +963,7 @@ int main()
     if (TestActorMetrics())     ++passed; else ++failed;
     if (TestClusterProxy())     ++passed; else ++failed;
     if (TestCollectActorStats())++passed; else ++failed;
+    if (TestTcpCluster())       ++passed; else ++failed;
 
     std::cout << "\n======================================" << std::endl;
     std::cout << "  Result: " << passed << " passed, " << failed << " failed" << std::endl;

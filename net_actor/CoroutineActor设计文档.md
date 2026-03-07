@@ -1489,7 +1489,7 @@ class GameServiceActor : public CoroutineActor {
 ║ 消息类型系统      ║  ✅   ║ std::any payload + 模板辅助方法       ║ A.8, 十七     ║
 ║ 指标监控          ║  ✅   ║ ActorMetrics + ProcessOne 自动计时     ║ A.9, 十八     ║
 ║ 优先级消息        ║  ✅   ║ 双队列邮箱 + SendPriority             ║ A.10, 十九    ║
-║ 跨进程/集群       ║  ✅   ║ ClusterProxy + IClusterTransport      ║ A.11, 二十    ║
+║ 跨进程/集群       ║  ✅   ║ ClusterProxy + TcpClusterTransport    ║ A.11, 二十    ║
 ╚═══════════════════╩═══════╩══════════════════════════════════════╩════════════════╝
 ```
 
@@ -1789,13 +1789,13 @@ bool Actor::ProcessOne() {
 
 ---
 
-### A.11 跨进程 / 集群（Cluster）— 重要度：⭐⭐ ✅ 已实现（基础框架）
+### A.11 跨进程 / 集群（Cluster）— 重要度：⭐⭐ ✅ 已实现（含 TCP 传输）
 
 **问题描述：**
 
 所有 Actor 在同一进程内，无法跨节点部署和水平扩展。
 
-**实现方案：** `ClusterProxy` 代理 Actor + `IClusterTransport` 传输接口 + `ClusterReceiver` 接收端
+**实现方案：** `ClusterProxy` 代理 Actor + `IClusterTransport` 传输接口 + `TcpClusterTransport` TCP 实现
 
 **新增文件：** `ClusterProxy.h` / `ClusterProxy.cc`
 
@@ -1807,14 +1807,16 @@ bool Actor::ProcessOne() {
 | `IClusterTransport` | 传输层接口（`SendPacket()`），可实现为 TCP/UDP/共享内存 |
 | `LoopbackTransport` | 同进程回环传输（单元测试用，handler 直接调用） |
 | `ClusterProxy` | 本地代理 Actor：收到消息 → 构造 `ClusterPacket` → 通过 transport 发送 |
-| `ClusterReceiver` | 接收端：`ClusterPacket` → `ActorMessage` → 按 ID/名字投递到本地 ActorSystem |
-| `ClusterPacket` | 网络数据包结构（sourceNodeId, targetNodeId, sourceActorId, targetActorId, targetActorName, data, sessionId, isResponse） |
+| `ClusterReceiver` | 接收端（LoopbackTransport 用）：`ClusterPacket` → `ActorMessage` → 投递到本地 ActorSystem |
+| `ClusterPacketCodec` | 二进制序列化/反序列化（长度前缀线协议，支持 TCP 流重组） |
+| `ClusterGatewayActor` | 集群 TCP I/O 处理 Actor（per-fd 接收缓冲区，握手协议，数据包路由） |
+| `TcpClusterTransport` | 真实 TCP 传输层：`Listen()`/`ConnectToNode()`/`SendPacket()`，基于 EventLoop+Acceptor+Connector |
 
 **两种寻址方式：**
 - 按 ID：`RemoteActorRef("nodeB", 42)` → 直接投递到 nodeB 的 Actor#42
 - 按名字：`RemoteActorRef("nodeB", "db_service")` → nodeB 端 `FindActor("db_service")` 查找后投递
 
-**当前限制：** 基础框架已就位，生产环境需扩展：TCP 传输层实现、protobuf 序列化、节点发现、跨进程 `co_await Call()` 等。
+**TCP 传输特性：** 长度前缀二进制协议、握手自动识别节点、TCP 流重组（半包/粘包处理）、双向通信、SpinLock 保护的 fd↔nodeId 映射。
 
 > 详细设计见 [二十、跨进程集群基础](#二十跨进程集群基础--clusterproxy)
 
@@ -1836,7 +1838,7 @@ P2       Actor 监控/Link (A.6)          解决 Call 目标不存在时的协�
 P2       消息类型系统 (A.8)              std::any payload + 模板辅助方法      ✅ 已实现
 P2       指标监控 (A.9)                  ActorMetrics + ProcessOne 耗时统计    ✅ 已实现
 P3       优先级消息 (A.10)              双队列邮箱 + SendPriority            ✅ 已实现
-P3       跨进程集群 (A.11)              ClusterProxy 基础框架                ✅ 已实现
+P3       跨进程集群 (A.11)              ClusterProxy + TcpClusterTransport   ✅ 已实现
 ```
 
 > **当前状态：全部 10 项改进已全部实现！🎉**
@@ -1844,7 +1846,7 @@ P3       跨进程集群 (A.11)              ClusterProxy 基础框架          
 > - **P0 核心**：异常保护、定时器系统
 > - **P1 易用**：Actor 命名/发现、邮箱容量控制、优雅关停
 > - **P2 监控**：Actor 监控/Link、消息类型系统（std::any payload）、指标监控（ActorMetrics）
-> - **P3 扩展**：优先级消息（双队列邮箱）、跨进程集群（ClusterProxy）
+> - **P3 扩展**：优先级消息（双队列邮箱）、跨进程集群（ClusterProxy + TCP 传输层）
 >
 > 各功能的详细设计文档见对应章节（十七～二十一）。
 
@@ -2326,13 +2328,139 @@ auto proxyId = nodeA_sys.RegisterActor(
 nodeA_sys.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello"});
 ```
 
-### 20.5 扩展方向
+### 20.5 TcpClusterTransport — 真实 TCP 跨网络传输
 
-当前为基础框架。生产环境需要扩展：
-- **TCP 传输层**：实现 `IClusterTransport` 的 TCP 版本
-- **序列化**：`ClusterPacket` 改用 protobuf / flatbuffers 序列化
+#### 20.5.1 设计动机
+
+`LoopbackTransport` 仅用于单元测试，无法真正实现跨进程/跨机器通信。`TcpClusterTransport` 基于现有的 `EventLoop` + `Acceptor` + `Connector` 网络栈，实现了真实的 TCP 集群传输。
+
+#### 20.5.2 架构总览
+
+```
+  ┌─────── Node A ────────────────┐     ┌─────── Node B ────────────────┐
+  │                                │     │                                │
+  │  SenderActor                   │     │  ReceiverActor (name="svc")   │
+  │    │ SendToActor(proxyId)      │     │    ↑ OnMessage()              │
+  │    ▼                           │     │    │                          │
+  │  ClusterProxy("nodeB","svc")   │     │  ClusterGatewayActor (内部)    │
+  │    │ OnMessage()               │     │    ↑ handleDecodedPacket()    │
+  │    │ → transport.SendPacket()  │     │    │ → sys.SendByName("svc") │
+  │    ▼                           │     │    │                          │
+  │  TcpClusterTransport           │     │  TcpClusterTransport          │
+  │    │ Encode() + conn.Send()    │     │    │ Acceptor 监听            │
+  │    ▼                           │     │    ▼                          │
+  │  Connector ──── TCP ────────── Acceptor   │                          │
+  │                                │     │                                │
+  └────────────────────────────────┘     └────────────────────────────────┘
+```
+
+#### 20.5.3 核心组件
+
+| 组件 | 职责 |
+|------|------|
+| `ClusterPacketCodec` | 二进制序列化/反序列化。线协议：`[4:body_len][body]`，支持 TCP 流重组（部分包/粘包） |
+| `ClusterGatewayActor` | 内部 Actor，处理集群 TCP I/O。per-fd 接收缓冲区实现流重组；处理握手包建立 fd↔nodeId 映射 |
+| `TcpClusterTransport` | 实现 `IClusterTransport`。`Listen(port)` 创建 Acceptor，`ConnectToNode()` 创建 Connector，`SendPacket()` 序列化后通过 Connection 发送 |
+
+#### 20.5.4 线协议（Wire Protocol）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  [4 bytes: body_length, big-endian]                         │
+├─────────────────────────────────────────────────────────────┤
+│  [2 bytes: sourceNodeId.len][sourceNodeId bytes]            │
+│  [2 bytes: targetNodeId.len][targetNodeId bytes]            │
+│  [4 bytes: sourceActorId]                                   │
+│  [4 bytes: targetActorId]                                   │
+│  [2 bytes: targetActorName.len][targetActorName bytes]      │
+│  [4 bytes: sessionId]                                       │
+│  [1 byte:  flags (bit0=isResponse)]                         │
+│  [4 bytes: data.len][data bytes]                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+所有整数使用网络字节序（big-endian）。最大包大小限制 16MB。
+
+#### 20.5.5 握手协议
+
+连接建立后，双方各发送一个握手包：
+
+```
+握手包: {
+    sourceNodeId = 本机 nodeId,
+    targetNodeId = "",
+    data = "CLUSTER_HANDSHAKE"
+}
+```
+
+收到握手包后，提取 `sourceNodeId` 并建立 fd → nodeId 映射。
+
+#### 20.5.6 TCP 流重组
+
+`ClusterGatewayActor` 为每个 fd 维护接收缓冲区（`recvBuffers_[fd]`）：
+
+```cpp
+void ClusterGatewayActor::OnMessage(ActorMessage& msg) {
+    if (msg.type == MsgType::NetworkRecv) {
+        auto& buf = recvBuffers_[msg.fd];
+        buf.append(msg.data);  // 追加新数据
+
+        while (true) {
+            ClusterPacket pkt;
+            size_t consumed = ClusterPacketCodec::Decode(buf.data(), buf.size(), pkt);
+            if (consumed == 0) break;  // 数据不完整
+            handleDecodedPacket(pkt, msg.fd);
+            buf.erase(0, consumed);
+        }
+    }
+}
+```
+
+#### 20.5.7 使用示例（真实 TCP）
+
+```cpp
+// ---- 节点 B（服务端） ----
+EventLoop loopB;  loopB.Create();
+ActorSystem sysB; sysB.Start(4, &loopB); loopB.SetActorSystem(&sysB);
+
+TcpClusterTransport transportB(&sysB, &loopB);
+transportB.SetLocalNodeId("nodeB");
+transportB.Listen(9600);  // 监听集群端口
+
+auto echoId = sysB.RegisterActor(make_unique<EchoActor>());
+sysB.RegisterName("echo_service", echoId);
+
+// ---- 节点 A（客户端） ----
+EventLoop loopA;  loopA.Create();
+ActorSystem sysA; sysA.Start(4, &loopA); loopA.SetActorSystem(&sysA);
+
+TcpClusterTransport transportA(&sysA, &loopA);
+transportA.SetLocalNodeId("nodeA");
+transportA.ConnectToNode("nodeB", "192.168.1.2", 9600);
+
+// 创建代理 → 透明转发到节点 B
+auto proxyId = sysA.RegisterActor(
+    make_unique<ClusterProxy>(RemoteActorRef("nodeB", "echo_service"), &transportA));
+sysA.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello cluster!"});
+```
+
+#### 20.5.8 线程安全分析
+
+| 数据结构 | 保护机制 | 说明 |
+|----------|----------|------|
+| `nodeToFd_` / `fdToNode_` | `SpinLock connLock_` | 多线程访问（worker 线程 SendPacket + IO 线程 RegisterNodeFd） |
+| `pendingNodeId_` | `SpinLock pendingLock_` | ConnectToNode 预存 + 握手完成后清理 |
+| `knownNodes_` | `SpinLock nodesLock_` | ConnectToNode 添加 + 握手/断连更新状态 |
+| `recvBuffers_` | 无锁 | 仅在 ClusterGatewayActor::OnMessage 中串行访问 |
+| `Connection::Send()` | `SpinLockQueue sendMQ_` | 内部已线程安全 |
+
+### 20.6 后续扩展方向
+
+- **序列化优化**：`ClusterPacket.data` 改用 protobuf / flatbuffers 序列化
 - **节点发现**：通过心跳/注册中心自动发现节点
-- **Call/Response**：跨进程的 `co_await Call()` 支持（需要 sessionId 回传）
+- **跨进程 Call/Response**：基于 `sessionId` 实现 `co_await ClusterCall()`
+- **断线重连**：检测连接断开后自动重新建立
+- **负载均衡**：同一 Actor 名字在多个节点上注册，代理端做轮询/随机路由
 
 ---
 
@@ -2353,6 +2481,7 @@ nodeA_sys.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello"});
 | 3 | TestActorMetrics | `ActorMetrics` 计数器和计时器：验证 `totalMsgProcessed`、`totalProcessTimeUs`、`maxProcessTimeUs`、`avgProcessTimeUs` 的正确性；测试 `Reset()` 方法 |
 | 4 | TestClusterProxy | `ClusterProxy` + `LoopbackTransport`：创建两个 ActorSystem 模拟两个节点，通过代理跨节点发送消息，验证按 ID 和按名字两种寻址方式 |
 | 5 | TestCollectActorStatsWithMetrics | `CollectActorStats()` 完整指标：注册 Actor、处理消息后，验证 `CollectActorStats()` 返回的指标数据（`totalMsgProcessed`、时间数据、`maxMailboxSize`）的正确性 |
+| 6 | TestTcpCluster | `TcpClusterTransport` 真实 TCP 测试：两个独立的 EventLoop+ActorSystem（Node A / Node B）通过 TCP 连接，验证握手、正向消息投递（A→B）、反向确认（B→A）、ClusterPacketCodec 编解码一致性、粘包/半包处理 |
 
 ### 21.3 构建依赖
 
@@ -2366,6 +2495,7 @@ SOURCES = test_advanced_features.cc \
 
 ### 21.4 测试架构说明
 
-所有测试均为**纯 Actor 间消息通信**测试（无需网络），但因 `ActorSystem::Start()` 需要 `EventLoop*` 参数（用于 Timer 集成），测试中会创建 `EventLoop` 实例。
+- Test1~5 为**纯 Actor 间消息通信**测试（无需网络），但因 `ActorSystem::Start()` 需要 `EventLoop*` 参数（用于 Timer 集成），测试中会创建 `EventLoop` 实例。
+- Test6 (`TestTcpCluster`) 使用**真实 TCP 网络通信**，创建两套 EventLoop+ActorSystem 在 localhost 上通过 TCP 连接，验证完整的跨节点数据流。
 
 每个测试函数独立创建 `ActorSystem`，测试完成后调用 `Stop()` 清理，确保测试间互不干扰。
