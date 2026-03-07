@@ -5,12 +5,13 @@
 @brief: Actor基类，每个Actor拥有独立的邮箱(mailbox)，消息串行处理
 
 改进记录（P0/P1/P2/P3 优化）：
-  [P0] 定时器辅助：SetTimeout/SetInterval/CancelTimer（委托给ActorSystem）
-  [P1] 命名辅助：FindActorByName/SendByName（委托给ActorSystem）
-  [P1] 邮箱高水位：SetMailboxHighWaterMark()，超过水位时打印告警
-  [P2] 监控/Link辅助：LinkTo/UnlinkFrom，被监控Actor退出时收到ActorDown消息
-  [P2] A.9 指标监控：ActorMetrics 结构，ProcessOne 内自动统计耗时和消息计数
-  [P3] A.10 优先级消息：双队列（priorityMailbox_ + normalMailbox_），优先处理高优先级消息
+ [P0] 定时器辅助：SetTimeout/SetInterval/CancelTimer（委托给ActorSystem）
+ [P1] 命名辅助：FindActorByName/SendByName（委托给ActorSystem）
+ [P1] 邮箱高水位：SetMailboxHighWaterMark()，超过水位时打印告警
+ [P2] 监控/Link辅助：LinkTo/UnlinkFrom，被监控Actor退出时收到ActorDown消息
+ [P2] A.9 指标监控：ActorMetrics 结构，ProcessOne 内自动统计耗时和消息计数
+ [P3] A.10 优先级消息：双队列（priorityMailbox_ + normalMailbox_），优先处理高优先级消息
+ [P3] A.11 跨进程集群：SendToRemote/RespondRemote，便捷的跨进程发送/回复
 */
 
 #include "precompiled.h"
@@ -108,6 +109,13 @@ protected:
     void LinkTo(uint32_t targetActorId);
     // 取消监控
     void UnlinkFrom(uint32_t targetActorId);
+
+    // ===== [P3] A.11 跨进程集群辅助方法 =====
+    // 跨进程发送消息（按远程节点ID + Actor名字寻址）
+    bool SendToRemote(const std::string& targetNodeId, const std::string& targetActorName,
+                      ActorMessage&& msg);
+    // 回复跨进程消息（根据 msg 中的 sourceNodeId + sourceActorName 自动路由回去）
+    bool RespondRemote(const ActorMessage& request, const std::string& responseData);
 
     uint32_t actorId_ = 0;
     ActorSystem* system_ = nullptr;

@@ -14,6 +14,7 @@
   [P2] A.8 消息类型系统：ActorMessage 支持 std::any payload 类型安全传递
   [P2] A.9 指标监控：ActorMetrics + ActorStat 扩展，支持耗时/消息计数统计
   [P3] A.10 优先级消息：SendPriority 高优先级消息发送
+  [P3] A.11 跨进程集群：RegisterTransport/SendToRemote/GetActorName，名字寻址
 */
 
 #include "precompiled.h"
@@ -27,6 +28,7 @@
 namespace bllsll {
 
 class EventLoop;
+class IClusterTransport;
 
 // [P2] A.9 Actor 统计信息（含指标数据，用于监控报告）
 struct ActorStat {
@@ -95,6 +97,16 @@ public:
     uint32_t FindActor(const std::string& name);
     // 按名字发消息
     bool SendByName(const std::string& name, ActorMessage&& msg);
+    // 按actorId反查名字（未注册名字返回空串）
+    std::string GetActorName(uint32_t actorId);
+
+    // ===== [P3] A.11 跨进程集群 =====
+    // 注册集群传输层（可注册多个，按 nodeId 路由）
+    void RegisterTransport(IClusterTransport* transport);
+    // 跨进程发送消息（按远程节点ID + Actor名字寻址）
+    // senderName: 发送方 Actor 名字（用于回程路由，可选，不填则自动查找 sourceId 对应名字）
+    bool SendToRemote(const std::string& targetNodeId, const std::string& targetActorName,
+                      ActorMessage&& msg, const std::string& senderName = "");
 
     // ===== [P2] Actor监控/Link =====
     // Link: watcherId 监控 targetId，当 target 退出/注销时，watcher 收到 ActorDown 消息
@@ -144,6 +156,10 @@ private:
     // [P2] Link 注册表: targetId → set<watcherId>
     bllsll::SpinLock linkLock_;
     std::unordered_map<uint32_t, std::set<uint32_t>> linkMap_;
+
+    // [P3] A.11 集群传输层列表
+    bllsll::SpinLock transportLock_;
+    std::vector<IClusterTransport*> transports_;
 };
 
 } // namespace bllsll

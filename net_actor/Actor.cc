@@ -184,3 +184,26 @@ void Actor::UnlinkFrom(uint32_t targetActorId)
         system_->UnlinkActor(actorId_, targetActorId);
     }
 }
+
+// ================================================================
+//  [P3] A.11 跨进程集群辅助方法
+// ================================================================
+
+bool Actor::SendToRemote(const std::string& targetNodeId, const std::string& targetActorName,
+                          ActorMessage&& msg)
+{
+    if (!system_) return false;
+    msg.sourceId = actorId_;
+    // senderName 由 ActorSystem::SendToRemote 内部通过 GetActorName 自动查找
+    return system_->SendToRemote(targetNodeId, targetActorName, std::move(msg));
+}
+
+bool Actor::RespondRemote(const ActorMessage& request, const std::string& responseData)
+{
+    if (!request.IsRemote() || !system_) return false;
+    ActorMessage resp{MsgType::UserMessage, actorId_, -1, responseData};
+    resp.sessionId = request.sessionId;
+    resp.isResponse = true;
+    return system_->SendToRemote(request.sourceNodeId, request.sourceActorName,
+                                  std::move(resp));
+}

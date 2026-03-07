@@ -8,10 +8,16 @@
   1. 每个进程（节点）有自己的 ActorSystem + EventLoop
   2. ClusterProxy 是一个特殊的本地 Actor，代表远程节点上的 Actor
   3. 当消息发给 ClusterProxy 时，它通过 IClusterTransport 序列化并转发到远程节点
-  4. 远程节点收到后，投递给本地目标 Actor
+  4. 远程节点收到后，按 Actor 名字路由给本地目标 Actor
+
+  关键设计决策 — 跨进程必须用名字寻址：
+  - 每个进程独立分配 actorId（从 1 递增），跨进程时 ID 无意义
+  - 跨进程通信统一使用 Actor 名字（通过 ActorSystem::RegisterName 注册）
+  - ClusterPacket 携带 sourceNodeId + sourceActorName 作为回程路由信息
+  - 接收方通过 msg.sourceNodeId + msg.sourceActorName 知道消息来源
 
 本文件定义：
-  - RemoteActorRef：远程 Actor 引用（nodeId + actorId/name）
+  - RemoteActorRef：远程 Actor 引用（nodeId + actorName）
   - IClusterTransport：集群传输层接口
   - LoopbackTransport：本地回环传输（用于单元测试）
   - ClusterProxy：本地代理 Actor
@@ -20,17 +26,17 @@
   - ClusterGatewayActor：集群 TCP I/O 处理 Actor（TCP 流重组）
   - TcpClusterTransport：基于 TCP 的真实跨网络/跨进程传输
 
-线协议（Wire Protocol）：
+线协议 v2（Wire Protocol）：
   [4 bytes: body_length, big-endian]
   [body]:
     [2 bytes: sourceNodeId.len][sourceNodeId]
     [2 bytes: targetNodeId.len][targetNodeId]
-    [4 bytes: sourceActorId]
-    [4 bytes: targetActorId]
+    [2 bytes: sourceActorName.len][sourceActorName]   // v2 新增：回程路由
     [2 bytes: targetActorName.len][targetActorName]
     [4 bytes: sessionId]
     [1 byte: flags (bit0=isResponse)]
     [4 bytes: data.len][data]
+  注：v2 移除了 sourceActorId/targetActorId（跨进程无意义）
 
 使用示例（真实 TCP）：
   // ---- 节点 B（服务端） ----
@@ -38,9 +44,9 @@
   ActorSystem sysB; sysB.Start(4, &loopB); loopB.SetActorSystem(&sysB);
   TcpClusterTransport transportB(&sysB, &loopB);
   transportB.SetLocalNodeId("nodeB");
-  transportB.Listen(9600);  // 监听集群端口
+  transportB.Listen(9600);
   auto echoId = sysB.RegisterActor(make_unique<EchoActor>());
-  sysB.RegisterName("echo_service", echoId);
+  sysB.RegisterName("echo_service", echoId);  // 必须注册名字！
 
   // ---- 节点 A（客户端） ----
   EventLoop loopA;  loopA.Create();
@@ -49,10 +55,21 @@
   transportA.SetLocalNodeId("nodeA");
   transportA.ConnectToNode("nodeB", "192.168.1.2", 9600);
 
-  // 创建代理 → 透明转发到节点 B
+  // 方式一：通过 ClusterProxy 代理
   RemoteActorRef ref("nodeB", "echo_service");
   auto proxyId = sysA.RegisterActor(make_unique<ClusterProxy>(ref, &transportA));
   sysA.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello cluster!"});
+
+  // 方式二：通过 ActorSystem::SendToRemote() 便捷方法（自动路由）
+  sysA.SendToRemote("nodeB", "echo_service", ActorMessage{...});
+
+  // 接收方回复：
+  void EchoActor::OnMessage(ActorMessage& msg) {
+    if (msg.IsRemote()) {
+      // 自动回复给来源 Actor
+      RespondRemote(msg, "echo:" + msg.data);
+    }
+  }
 */
 
 #include "precompiled.h"
@@ -71,23 +88,19 @@ class Acceptor;
 // ================================================================
 
 struct RemoteActorRef {
-    std::string nodeId;        // 远程节点标识（如 "node_001" 或 "192.168.1.1:9527"）
-    uint32_t remoteActorId;    // 远程节点上的 actorId
-    std::string remoteName;    // 远程 Actor 名字（可选，用于按名查找）
+    std::string nodeId;        // 远程节点标识（如 "nodeB" 或 "192.168.1.1:9527"）
+    std::string remoteName;    // 远程 Actor 名字（跨进程必须使用名字寻址）
 
-    RemoteActorRef() : remoteActorId(0) {}
-    RemoteActorRef(const std::string& node, uint32_t id)
-        : nodeId(node), remoteActorId(id) {}
+    RemoteActorRef() = default;
     RemoteActorRef(const std::string& node, const std::string& name)
-        : nodeId(node), remoteActorId(0), remoteName(name) {}
+        : nodeId(node), remoteName(name) {}
 
     bool IsValid() const {
-        return !nodeId.empty() && (remoteActorId > 0 || !remoteName.empty());
+        return !nodeId.empty() && !remoteName.empty();
     }
 
     std::string ToString() const {
-        return nodeId + ":" +
-               (remoteActorId > 0 ? std::to_string(remoteActorId) : remoteName);
+        return nodeId + "::" + remoteName;
     }
 };
 
@@ -111,11 +124,10 @@ struct ClusterNode {
 // ================================================================
 
 struct ClusterPacket {
-    std::string sourceNodeId;       // 发送方节点
-    std::string targetNodeId;       // 目标节点
-    uint32_t sourceActorId = 0;     // 发送方 actorId
-    uint32_t targetActorId = 0;     // 目标 actorId
-    std::string targetActorName;    // 目标 Actor 名字（按名寻址时使用）
+    std::string sourceNodeId;       // 发送方节点 ID（如 "nodeA"）
+    std::string targetNodeId;       // 目标节点 ID（如 "nodeB"）
+    std::string sourceActorName;    // 发送方 Actor 名字（回程路由用）
+    std::string targetActorName;    // 目标 Actor 名字（跨进程必须用名字寻址）
     uint32_t sessionId = 0;         // 会话 ID（用于 Call/Response）
     bool isResponse = false;        // 是否是响应
     std::string data;               // 序列化的消息数据
@@ -230,30 +242,7 @@ public:
 
     const RemoteActorRef& GetRemoteRef() const { return remote_; }
 
-    void OnMessage(ActorMessage& msg) override
-    {
-        if (!transport_) {
-            std::cerr << "[ClusterProxy] no transport! actorId=" << GetActorId()
-                      << ", remote=" << remote_.ToString() << std::endl;
-            return;
-        }
-
-        ClusterPacket packet;
-        packet.sourceNodeId = transport_->GetLocalNodeId();
-        packet.targetNodeId = remote_.nodeId;
-        packet.sourceActorId = msg.sourceId;
-        packet.targetActorId = remote_.remoteActorId;
-        packet.targetActorName = remote_.remoteName;
-        packet.sessionId = msg.sessionId;
-        packet.isResponse = msg.isResponse;
-        packet.data = msg.data;
-
-        bool ok = transport_->SendPacket(packet);
-        if (!ok) {
-            std::cerr << "[ClusterProxy] SendPacket failed! remote="
-                      << remote_.ToString() << std::endl;
-        }
-    }
+    void OnMessage(ActorMessage& msg) override;
 
 private:
     RemoteActorRef remote_;

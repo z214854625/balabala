@@ -7,6 +7,7 @@
 改进记录：
   [P2] A.8 消息类型系统：添加 std::any payload 支持类型安全消息传递
   [P3] A.10 优先级消息：添加 priority 字段支持高优先级消息
+  [P3] A.11 跨进程集群：添加 sourceNodeId/sourceActorName 支持跨进程回程路由
 */
 
 #include <string>
@@ -27,12 +28,18 @@ enum class MsgType : uint32_t {
 
 struct ActorMessage {
     MsgType type = MsgType::None;
-    uint32_t sourceId = 0;     // 来源actor id (0表示系统/网络消息)
+    uint32_t sourceId = 0;     // 来源actor id (0表示系统/网络消息，仅本进程有效)
     int fd = -1;               // 关联的fd
     std::string data;          // 消息数据（字符串格式，向后兼容）
     uint32_t sessionId = 0;    // 协程会话ID（用于Call/Response配对）
     bool isResponse = false;   // 是否为Call的响应消息
     bool priority = false;     // [P3] A.10 是否为高优先级消息
+
+    // [P3] A.11 跨进程集群回程路由信息
+    // 当消息来自远程节点时，这两个字段标识发送方的身份
+    // 本地消息时为空，仅集群消息时填充
+    std::string sourceNodeId;      // 发送方节点 ID（如 "nodeA"）
+    std::string sourceActorName;   // 发送方 Actor 名字（如 "echo_service"）
 
     // [P2] A.8 类型安全 payload（替代纯字符串传递，可选使用）
     std::any payload;
@@ -40,6 +47,9 @@ struct ActorMessage {
     ActorMessage() = default;
     ActorMessage(MsgType t, uint32_t src, int f, std::string d)
         : type(t), sourceId(src), fd(f), data(std::move(d)) {}
+
+    // 检查是否为跨进程消息（有远程来源信息）
+    bool IsRemote() const { return !sourceNodeId.empty(); }
 
     // ===== [P2] A.8 类型安全 payload 辅助方法 =====
 

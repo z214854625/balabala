@@ -8,6 +8,35 @@ using namespace bllsll;
 using namespace std;
 
 // ================================================================
+//  ClusterProxy::OnMessage — 本地代理 Actor
+//  收到消息后，通过 transport 转发到远程节点
+// ================================================================
+
+void ClusterProxy::OnMessage(ActorMessage& msg)
+{
+    if (!transport_) return;
+
+    // 自动查找发送方 Actor 的注册名字（用于回程路由）
+    std::string senderName;
+    if (system_ && msg.sourceId > 0) {
+        senderName = system_->GetActorName(msg.sourceId);
+    }
+
+    ClusterPacket pkt;
+    pkt.sourceNodeId = transport_->GetLocalNodeId();
+    pkt.targetNodeId = remote_.nodeId;
+    pkt.sourceActorName = senderName;
+    pkt.targetActorName = remote_.remoteName;
+    pkt.sessionId = msg.sessionId;
+    pkt.isResponse = msg.isResponse;
+    pkt.data = msg.data;
+
+    if (!transport_->SendPacket(pkt)) {
+        std::cerr << "[ClusterProxy] failed to send to " << remote_.ToString() << std::endl;
+    }
+}
+
+// ================================================================
 //  ClusterReceiver — LoopbackTransport 用
 // ================================================================
 
@@ -17,16 +46,20 @@ void ClusterReceiver::OnPacketReceived(const ClusterPacket& packet)
 
     ActorMessage msg;
     msg.type = MsgType::UserMessage;
-    msg.sourceId = packet.sourceActorId;
+    msg.sourceId = 0;  // 跨进程 sourceId 无意义
     msg.sessionId = packet.sessionId;
     msg.isResponse = packet.isResponse;
     msg.data = packet.data;
+    // 设置跨进程路由信息（接收方可通过 IsRemote()/RespondRemote() 使用）
+    msg.sourceNodeId = packet.sourceNodeId;
+    msg.sourceActorName = packet.sourceActorName;
 
-    // 优先按名字寻址，其次按 actorId
+    // 跨进程只能按名字寻址
     if (!packet.targetActorName.empty()) {
         sys_->SendByName(packet.targetActorName, std::move(msg));
-    } else if (packet.targetActorId > 0) {
-        sys_->Send(packet.targetActorId, std::move(msg));
+    } else {
+        std::cerr << "[ClusterReceiver] packet has no targetActorName, from="
+                  << packet.sourceNodeId << std::endl;
     }
 }
 
@@ -114,15 +147,14 @@ bool ClusterPacketCodec::ReadStr32(const char*& p, const char* end, std::string&
 
 std::string ClusterPacketCodec::Encode(const ClusterPacket& pkt)
 {
-    // 先编码 body
+    // 先编码 body（v2 协议：移除 actorId 字段，添加 sourceActorName）
     std::string body;
     body.reserve(128);
 
     WriteStr16(body, pkt.sourceNodeId);
     WriteStr16(body, pkt.targetNodeId);
-    WriteU32(body, pkt.sourceActorId);
-    WriteU32(body, pkt.targetActorId);
-    WriteStr16(body, pkt.targetActorName);
+    WriteStr16(body, pkt.sourceActorName);    // v2: 发送方 Actor 名字
+    WriteStr16(body, pkt.targetActorName);    // 目标 Actor 名字
     WriteU32(body, pkt.sessionId);
     WriteU8(body, pkt.isResponse ? 1 : 0);
     WriteStr32(body, pkt.data);
@@ -154,10 +186,10 @@ size_t ClusterPacketCodec::Decode(const char* data, size_t len, ClusterPacket& o
     const char* p = data + 4;
     const char* end = data + 4 + bodyLen;
 
+    // v2 协议：移除 actorId 字段，添加 sourceActorName
     if (!ReadStr16(p, end, out.sourceNodeId)) return 0;
     if (!ReadStr16(p, end, out.targetNodeId)) return 0;
-    if (!ReadU32(p, end, out.sourceActorId)) return 0;
-    if (!ReadU32(p, end, out.targetActorId)) return 0;
+    if (!ReadStr16(p, end, out.sourceActorName)) return 0;    // v2
     if (!ReadStr16(p, end, out.targetActorName)) return 0;
     if (!ReadU32(p, end, out.sessionId)) return 0;
 
@@ -245,22 +277,23 @@ void ClusterGatewayActor::handleDecodedPacket(const ClusterPacket& pkt, int fd)
 
     ActorMessage actorMsg;
     actorMsg.type = MsgType::UserMessage;
-    actorMsg.sourceId = pkt.sourceActorId;
+    actorMsg.sourceId = 0;  // 跨进程 sourceId 无意义
     actorMsg.sessionId = pkt.sessionId;
     actorMsg.isResponse = pkt.isResponse;
     actorMsg.data = pkt.data;
+    // 设置跨进程路由信息（接收方可通过 IsRemote()/RespondRemote() 使用）
+    actorMsg.sourceNodeId = pkt.sourceNodeId;
+    actorMsg.sourceActorName = pkt.sourceActorName;
 
-    // 优先按名字寻址，其次按 actorId
+    // 跨进程只能按名字寻址
     if (!pkt.targetActorName.empty()) {
         bool sent = sys->SendByName(pkt.targetActorName, std::move(actorMsg));
         if (!sent) {
             std::cerr << "[ClusterGateway] target actor name not found: "
                       << pkt.targetActorName << std::endl;
         }
-    } else if (pkt.targetActorId > 0) {
-        sys->Send(pkt.targetActorId, std::move(actorMsg));
     } else {
-        std::cerr << "[ClusterGateway] packet has no target, from="
+        std::cerr << "[ClusterGateway] packet has no targetActorName, from="
                   << pkt.sourceNodeId << std::endl;
     }
 }
@@ -462,12 +495,12 @@ void TcpClusterTransport::sendHandshake(int fd)
         return;
     }
 
-    // 构造握手包
+    // 构造握手包（v2 协议：无 actorId 字段）
     ClusterPacket handshake;
     handshake.sourceNodeId = localNodeId_;
     handshake.targetNodeId = "";  // 对方还不知道
-    handshake.sourceActorId = 0;
-    handshake.targetActorId = 0;
+    handshake.sourceActorName = "";  // 握手无需 Actor 名字
+    handshake.targetActorName = "";
     handshake.sessionId = 0;
     handshake.isResponse = false;
     handshake.data = CLUSTER_HANDSHAKE_MAGIC;

@@ -672,7 +672,7 @@ public:
             ClusterPacket ackPkt;
             ackPkt.sourceNodeId = transport->GetLocalNodeId();
             ackPkt.targetNodeId = ackNodeId;
-            ackPkt.sourceActorId = GetActorId();
+            ackPkt.sourceActorName = GetSystem()->GetActorName(GetActorId());
             ackPkt.targetActorName = ackActorName;
             ackPkt.data = "ack:" + msg.data;
             transport->SendPacket(ackPkt);
@@ -854,8 +854,7 @@ bool TestTcpCluster()
         ClusterPacket testPkt;
         testPkt.sourceNodeId = "test_node_A";
         testPkt.targetNodeId = "test_node_B";
-        testPkt.sourceActorId = 42;
-        testPkt.targetActorId = 99;
+        testPkt.sourceActorName = "my_sender";
         testPkt.targetActorName = "my_service";
         testPkt.sessionId = 12345;
         testPkt.isResponse = true;
@@ -872,8 +871,7 @@ bool TestTcpCluster()
         }
         if (decoded.sourceNodeId != testPkt.sourceNodeId ||
             decoded.targetNodeId != testPkt.targetNodeId ||
-            decoded.sourceActorId != testPkt.sourceActorId ||
-            decoded.targetActorId != testPkt.targetActorId ||
+            decoded.sourceActorName != testPkt.sourceActorName ||
             decoded.targetActorName != testPkt.targetActorName ||
             decoded.sessionId != testPkt.sessionId ||
             decoded.isResponse != testPkt.isResponse ||

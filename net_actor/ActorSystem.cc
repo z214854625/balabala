@@ -1,5 +1,6 @@
 #include "ActorSystem.h"
 #include "EventLoop.h"
+#include "ClusterProxy.h"
 
 using namespace bllsll;
 using namespace std;
@@ -377,6 +378,67 @@ std::vector<ActorStat> ActorSystem::CollectActorStats()
     }
 
     return stats;
+}
+
+// ================================================================
+//  [P1] 按 actorId 反查名字
+// ================================================================
+
+std::string ActorSystem::GetActorName(uint32_t actorId)
+{
+    bllsll::LockGuard<bllsll::SpinLock> lock(nameLock_);
+    auto it = actorToName_.find(actorId);
+    if (it != actorToName_.end()) {
+        return it->second;
+    }
+    return "";
+}
+
+// ================================================================
+//  [P3] A.11 跨进程集群
+// ================================================================
+
+void ActorSystem::RegisterTransport(IClusterTransport* transport)
+{
+    if (!transport) return;
+    bllsll::LockGuard<bllsll::SpinLock> lock(transportLock_);
+    // 避免重复注册
+    for (auto* t : transports_) {
+        if (t == transport) return;
+    }
+    transports_.push_back(transport);
+    std::cout << "[ActorSystem] RegisterTransport nodeId=" << transport->GetLocalNodeId() << std::endl;
+}
+
+bool ActorSystem::SendToRemote(const std::string& targetNodeId, const std::string& targetActorName,
+                                ActorMessage&& msg, const std::string& senderName)
+{
+    // 确定发送方名字（优先使用显式传入的 senderName，否则自动查找）
+    std::string resolvedSenderName = senderName;
+    if (resolvedSenderName.empty() && msg.sourceId > 0) {
+        resolvedSenderName = GetActorName(msg.sourceId);
+    }
+
+    // 查找可以到达 targetNodeId 的 transport
+    bllsll::LockGuard<bllsll::SpinLock> lock(transportLock_);
+    for (auto* transport : transports_) {
+        if (!transport) continue;
+        // 构建 ClusterPacket
+        ClusterPacket pkt;
+        pkt.sourceNodeId = transport->GetLocalNodeId();
+        pkt.targetNodeId = targetNodeId;
+        pkt.sourceActorName = resolvedSenderName;
+        pkt.targetActorName = targetActorName;
+        pkt.sessionId = msg.sessionId;
+        pkt.isResponse = msg.isResponse;
+        pkt.data = std::move(msg.data);
+
+        if (transport->SendPacket(pkt)) {
+            return true;
+        }
+    }
+    std::cerr << "[ActorSystem::SendToRemote] no transport for nodeId=" << targetNodeId << std::endl;
+    return false;
 }
 
 // ================================================================

@@ -1,6 +1,6 @@
 /**
  * @file test_cluster_node.cc
- * @brief 跨进程集群通信测试 — 两个独立进程通过 TCP 通信
+ * @brief 跨进程集群通信测试 — 两个独立进程通过 TCP 通信（name-based routing v2）
  *
  * 用法:
  *   ./test_cluster_node -a          # 启动 NodeA（服务端，监听 19700）
@@ -9,21 +9,23 @@
  * 测试场景:
  *   NodeA（服务端进程）：
  *     - TcpClusterTransport 监听 19700 端口
- *     - "echo_service"   Actor：收到消息后通过集群 transport 回传 "echo:<原始数据>"
- *     - "counter_service" Actor：计数收到的消息，接收 "get_count" 时回传计数值
+ *     - "echo_service"   Actor：收到远程消息后，用 RespondRemote() 回传 "echo:<data>"
+ *     - "counter_service" Actor：计数收到的消息，"get_count" 时用 RespondRemote() 回传计数
  *
  *   NodeB（客户端进程）：
  *     - TcpClusterTransport 连接 NodeA (127.0.0.1:19700)
- *     - "result_collector" Actor：收集来自 NodeA 的 echo 响应
- *     - 通过 ClusterProxy 向 NodeA 的 echo_service 发送 10 条消息
- *     - 通过 ClusterProxy 向 NodeA 的 counter_service 发送 5 条消息
- *     - 验证收到的 echo 响应数量和内容
+ *     - "result_collector" Actor：收集来自 NodeA 的响应（通过 sourceNodeId + sourceActorName 路由回来）
+ *     - 方式一：通过 ClusterProxy 向 NodeA 的 echo_service 发送消息
+ *     - 方式二：通过 ActorSystem::SendToRemote() 便捷方法发送
+ *     - 验证收到的响应数量和内容
  *
- * 数据流:
- *   NodeB                               NodeA
- *   ClusterProxy ──TCP──> ClusterGatewayActor ──> echo_service
- *                                                    │
- *   result_collector <──TCP── TcpClusterTransport <──┘
+ * 数据流（name-based routing）:
+ *   NodeB                                       NodeA
+ *   ClusterProxy ─────TCP────> GatewayActor ──(SendByName)──> echo_service
+ *   (sourceActorName="result_collector")                          │
+ *                                                                 │ RespondRemote()
+ *   result_collector <──(SendByName)── GatewayActor <───TCP──────┘
+ *   (msg.sourceNodeId="nodeA", msg.sourceActorName="echo_service")
  *
  * 编译: make -f Makefile.cluster
  * 运行: ./run_test_cluster.sh
@@ -63,13 +65,13 @@ static void SignalHandler(int sig)
 
 /**
  * EchoServiceActor（NodeA 上运行）
- * - 收到 UserMessage 后，通过 TcpClusterTransport 将 "echo:<data>" 回传给 NodeB
- * - 回传目标：nodeB 的 "result_collector" Actor（按名字寻址）
+ * - 收到远程消息后，用 RespondRemote() 将 "echo:<data>" 自动回传给发送方
+ * - RespondRemote() 内部根据 msg.sourceNodeId + msg.sourceActorName 自动路由
+ * - 不再需要持有 TcpClusterTransport* 或手动构建 ClusterPacket
  */
 class EchoServiceActor : public Actor
 {
 public:
-    TcpClusterTransport* transport_ = nullptr;
     std::atomic<int> recvCount{0};
 
     void OnMessage(ActorMessage& msg) override
@@ -77,36 +79,26 @@ public:
         if (msg.type != MsgType::UserMessage) return;
 
         int cnt = recvCount.fetch_add(1) + 1;
-        std::cout << "[NodeA:echo_service] recv #" << cnt << ": " << msg.data << std::endl;
+        std::cout << "[NodeA:echo_service] recv #" << cnt << ": " << msg.data
+                  << " (from " << msg.sourceNodeId << "::" << msg.sourceActorName << ")" << std::endl;
 
-        // 构造响应 ClusterPacket，发回 NodeB 的 result_collector
-        if (transport_) {
-            ClusterPacket resp;
-            resp.sourceNodeId = transport_->GetLocalNodeId();
-            resp.targetNodeId = "nodeB";
-            resp.sourceActorId = GetActorId();
-            resp.targetActorName = "result_collector";
-            resp.data = "echo:" + msg.data;
-            resp.sessionId = msg.sessionId;
-            resp.isResponse = false;
-
-            bool ok = transport_->SendPacket(resp);
-            if (!ok) {
-                std::cerr << "[NodeA:echo_service] failed to send echo response!" << std::endl;
-            }
+        // 使用 RespondRemote() 自动回复给来源 Actor
+        // 内部会根据 msg.sourceNodeId + msg.sourceActorName 路由回去
+        if (msg.IsRemote()) {
+            RespondRemote(msg, "echo:" + msg.data);
         }
     }
 };
 
 /**
  * CounterServiceActor（NodeA 上运行）
- * - 收到 "get_count" 时，将当前计数通过 transport 发回 NodeB
+ * - 收到 "get_count" 时，用 RespondRemote() 将计数值回传给发送方
  * - 收到其他消息时，计数 +1
+ * - 不再需要持有 TcpClusterTransport* 或手动构建 ClusterPacket
  */
 class CounterServiceActor : public Actor
 {
 public:
-    TcpClusterTransport* transport_ = nullptr;
     std::atomic<int> counter{0};
 
     void OnMessage(ActorMessage& msg) override
@@ -114,17 +106,11 @@ public:
         if (msg.type != MsgType::UserMessage) return;
 
         if (msg.data == "get_count") {
-            // 返回计数值
             std::cout << "[NodeA:counter_service] get_count request, count="
-                      << counter.load() << std::endl;
-            if (transport_) {
-                ClusterPacket resp;
-                resp.sourceNodeId = transport_->GetLocalNodeId();
-                resp.targetNodeId = "nodeB";
-                resp.sourceActorId = GetActorId();
-                resp.targetActorName = "result_collector";
-                resp.data = "count:" + std::to_string(counter.load());
-                transport_->SendPacket(resp);
+                      << counter.load()
+                      << " (from " << msg.sourceNodeId << "::" << msg.sourceActorName << ")" << std::endl;
+            if (msg.IsRemote()) {
+                RespondRemote(msg, "count:" + std::to_string(counter.load()));
             }
         } else {
             int cnt = counter.fetch_add(1) + 1;
@@ -206,20 +192,19 @@ int RunNodeA()
     sys.Start(4, &loop);
     loop.SetActorSystem(&sys);
 
-    // 2. 创建 TcpClusterTransport
+    // 2. 创建 TcpClusterTransport 并注册到 ActorSystem
     TcpClusterTransport transport(&sys, &loop);
     transport.SetLocalNodeId("nodeA");
     transport.Listen(CLUSTER_PORT);
+    sys.RegisterTransport(&transport);  // 注册 transport，使 SendToRemote/RespondRemote 可用
 
-    // 3. 注册服务 Actor
+    // 3. 注册服务 Actor（不再需要传入 transport 指针）
     auto echoPtr = std::make_unique<EchoServiceActor>();
-    echoPtr->transport_ = &transport;
     EchoServiceActor* echo = echoPtr.get();
     uint32_t echoId = sys.RegisterActor(std::move(echoPtr));
     sys.RegisterName("echo_service", echoId);
 
     auto counterPtr = std::make_unique<CounterServiceActor>();
-    counterPtr->transport_ = &transport;
     CounterServiceActor* counter = counterPtr.get();
     uint32_t counterId = sys.RegisterActor(std::move(counterPtr));
     sys.RegisterName("counter_service", counterId);
@@ -263,10 +248,11 @@ int RunNodeB()
     sys.Start(4, &loop);
     loop.SetActorSystem(&sys);
 
-    // 2. 创建 TcpClusterTransport
+    // 2. 创建 TcpClusterTransport 并注册到 ActorSystem
     TcpClusterTransport transport(&sys, &loop);
     transport.SetLocalNodeId("nodeB");
     transport.ConnectToNode("nodeA", "127.0.0.1", CLUSTER_PORT);
+    sys.RegisterTransport(&transport);  // 注册 transport，使 SendToRemote 可用
 
     // 3. 等待握手完成
     std::cout << "[NodeB] Waiting for handshake with NodeA..." << std::endl;

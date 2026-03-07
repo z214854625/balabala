@@ -2199,8 +2199,8 @@ Skynet 通过 `skynet.cluster.call(node, addr, ...)` 提供跨节点 RPC。
   │    ▼                         │     │                              │
   │  ClusterProxy(nodeB, dbSvc)  │     │  ClusterReceiver             │
   │    │ OnMessage()             │     │    ← OnPacketReceived()      │
-  │    │ → 构造 ClusterPacket    │     │    → sys.Send(targetId, msg) │
-  │    │ → transport.SendPacket()│     │    或 sys.SendByName(name)   │
+  │    │ → 构造 ClusterPacket    │     │    → sys.SendByName(name)   │
+  │    │ → transport.SendPacket()│     │    (仅名字路由)              │
   │    ▼                         │     │                              │
   │  IClusterTransport           │ ──→ │  IClusterTransport           │
   │  (TCP/UDP/Loopback)          │     │  (TCP/UDP/Loopback)          │
@@ -2216,17 +2216,20 @@ Skynet 通过 `skynet.cluster.call(node, addr, ...)` 提供跨节点 RPC。
 ```cpp
 struct RemoteActorRef {
     std::string nodeId;        // 远程节点标识
-    uint32_t remoteActorId;    // 远程 actorId（按 ID 寻址）
-    std::string remoteName;    // 远程 Actor 名字（按名寻址）
+    std::string remoteName;    // 远程 Actor 名字（唯一寻址方式）
 
+    RemoteActorRef(const std::string& node, const std::string& name);
     bool IsValid() const;
     std::string ToString() const;
 };
 ```
 
-支持两种寻址方式：
-- **按 ID**：`RemoteActorRef("nodeB", 42)` → 直接路由到 nodeB 的 Actor#42
-- **按名字**：`RemoteActorRef("nodeB", "db_service")` → nodeB 通过 `FindActor("db_service")` 查找
+**仅支持名字寻址**：`RemoteActorRef("nodeB", "db_service")` → nodeB 通过 `FindActor("db_service")` 查找
+
+> **为什么移除了按 ID 寻址？**
+>
+> 每个进程独立分配 `actorId`（从 1 递增），NodeA 的 `actorId=3` ≠ NodeB 的 `actorId=3`。
+> 跨进程传输 `actorId` 毫无意义，必须使用通过 `RegisterName()` 注册的全局唯一名字。
 
 #### 20.3.2 IClusterTransport — 传输层接口
 
@@ -2263,13 +2266,16 @@ public:
     ClusterProxy(const RemoteActorRef& remote, IClusterTransport* transport);
 
     void OnMessage(ActorMessage& msg) override {
-        // 构造 ClusterPacket
+        // 构造 ClusterPacket（纯名字路由）
         ClusterPacket packet;
         packet.sourceNodeId = transport_->GetLocalNodeId();
         packet.targetNodeId = remote_.nodeId;
-        packet.targetActorId = remote_.remoteActorId;
+        // 自动填充发送方 Actor 名字（用于回程路由）
+        packet.sourceActorName = system_ ? system_->GetActorName(actorId_) : "";
         packet.targetActorName = remote_.remoteName;
         packet.data = msg.data;
+        packet.sessionId = msg.sessionId;
+        packet.isResponse = msg.isResponse;
         // 通过传输层发送
         transport_->SendPacket(packet);
     }
@@ -2285,19 +2291,25 @@ public:
     void OnPacketReceived(const ClusterPacket& packet);
 };
 
-// 实现
+// 实现（v2: 纯名字路由 + 回程信息填充）
 void ClusterReceiver::OnPacketReceived(const ClusterPacket& packet) {
-    ActorMessage msg{MsgType::UserMessage, packet.sourceActorId, -1, packet.data};
+    ActorMessage msg{MsgType::UserMessage, 0, -1, packet.data};
     msg.sessionId = packet.sessionId;
     msg.isResponse = packet.isResponse;
+    // 填充回程路由信息（接收方可用 RespondRemote() 自动回复）
+    msg.sourceNodeId = packet.sourceNodeId;
+    msg.sourceActorName = packet.sourceActorName;
 
-    if (packet.targetActorId > 0) {
-        sys_->Send(packet.targetActorId, std::move(msg));  // 按 ID 投递
-    } else if (!packet.targetActorName.empty()) {
-        sys_->SendByName(packet.targetActorName, std::move(msg));  // 按名投递
+    // 仅支持名字路由（actorId 跨进程无意义）
+    if (!packet.targetActorName.empty()) {
+        sys_->SendByName(packet.targetActorName, std::move(msg));
     }
 }
 ```
+
+> **关键变化（v2）**：
+> - 移除了 `targetActorId` 路由路径，仅保留名字路由
+> - `msg.sourceNodeId` 和 `msg.sourceActorName` 携带了发送方信息，接收方可用 `RespondRemote()` 自动回复
 
 ### 20.4 使用示例（同进程回环测试）
 
@@ -2362,24 +2374,25 @@ nodeA_sys.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello"});
 | `ClusterGatewayActor` | 内部 Actor，处理集群 TCP I/O。per-fd 接收缓冲区实现流重组；处理握手包建立 fd↔nodeId 映射 |
 | `TcpClusterTransport` | 实现 `IClusterTransport`。`Listen(port)` 创建 Acceptor，`ConnectToNode()` 创建 Connector，`SendPacket()` 序列化后通过 Connection 发送 |
 
-#### 20.5.4 线协议（Wire Protocol）
+#### 20.5.4 线协议 v2（Wire Protocol）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  [4 bytes: body_length, big-endian]                         │
 ├─────────────────────────────────────────────────────────────┤
-│  [2 bytes: sourceNodeId.len][sourceNodeId bytes]            │
-│  [2 bytes: targetNodeId.len][targetNodeId bytes]            │
-│  [4 bytes: sourceActorId]                                   │
-│  [4 bytes: targetActorId]                                   │
-│  [2 bytes: targetActorName.len][targetActorName bytes]      │
+│  [2 bytes: sourceNodeId.len][sourceNodeId bytes]  (Str16)   │
+│  [2 bytes: targetNodeId.len][targetNodeId bytes]  (Str16)   │
+│  [2 bytes: sourceActorName.len][sourceActorName]  (Str16)   │
+│  [2 bytes: targetActorName.len][targetActorName]  (Str16)   │
 │  [4 bytes: sessionId]                                       │
 │  [1 byte:  flags (bit0=isResponse)]                         │
-│  [4 bytes: data.len][data bytes]                            │
+│  [4 bytes: data.len][data bytes]                  (Str32)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 所有整数使用网络字节序（big-endian）。最大包大小限制 16MB。
+
+> **v2 变化**：移除了 `sourceActorId` 和 `targetActorId`（跨进程无意义），新增 `sourceActorName` 用于回程路由。
 
 #### 20.5.5 握手协议
 
@@ -2454,7 +2467,88 @@ sysA.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello cluster!"});
 | `recvBuffers_` | 无锁 | 仅在 ClusterGatewayActor::OnMessage 中串行访问 |
 | `Connection::Send()` | `SpinLockQueue sendMQ_` | 内部已线程安全 |
 
-### 20.6 后续扩展方向
+### 20.6 跨进程便利 API — SendToRemote / RespondRemote
+
+#### 20.6.1 ActorMessage 跨进程字段
+
+```cpp
+struct ActorMessage {
+    // ... 原有字段 ...
+    std::string sourceNodeId;      // 发送方节点 ID（跨进程回程路由）
+    std::string sourceActorName;   // 发送方 Actor 名字（跨进程回程路由）
+
+    bool IsRemote() const { return !sourceNodeId.empty(); }
+};
+```
+
+当消息从远程节点到达时，`sourceNodeId` 和 `sourceActorName` 会被自动填充。接收方可通过 `msg.IsRemote()` 判断消息是否来自远程节点。
+
+#### 20.6.2 Actor::SendToRemote — 直接发送跨进程消息
+
+```cpp
+// Actor.h
+bool SendToRemote(const std::string& targetNodeId,
+                  const std::string& targetActorName,
+                  ActorMessage&& msg);
+```
+
+不需要创建 `ClusterProxy` 对象，直接通过 `ActorSystem` 注册的 transport 发送：
+
+```cpp
+class MyActor : public Actor {
+    void someMethod() {
+        ActorMessage msg{MsgType::UserMessage, 0, -1, "hello remote!"};
+        SendToRemote("nodeB", "echo_service", std::move(msg));
+    }
+};
+```
+
+`SendToRemote` 内部会自动填充 `sourceActorName`（通过 `ActorSystem::GetActorName()` 反查）。
+
+#### 20.6.3 Actor::RespondRemote — 自动回复远程请求
+
+```cpp
+// Actor.h
+bool RespondRemote(const ActorMessage& request, const std::string& responseData);
+```
+
+接收到远程消息后，使用 `RespondRemote()` 可自动将回复路由回发送方：
+
+```cpp
+class EchoServiceActor : public Actor {
+    void OnMessage(ActorMessage& msg) override {
+        if (msg.IsRemote()) {
+            // 自动读取 msg.sourceNodeId + msg.sourceActorName 进行回程路由
+            RespondRemote(msg, "echo:" + msg.data);
+        }
+    }
+};
+```
+
+等价于手动构造：
+```cpp
+ActorMessage resp{MsgType::UserMessage, actorId_, -1, "echo:" + msg.data};
+resp.sessionId = msg.sessionId;
+resp.isResponse = true;
+system_->SendToRemote(msg.sourceNodeId, msg.sourceActorName, std::move(resp));
+```
+
+#### 20.6.4 ActorSystem::RegisterTransport — 注册传输层
+
+```cpp
+void ActorSystem::RegisterTransport(IClusterTransport* transport);
+```
+
+`SendToRemote()` 依赖已注册的 transport。启动时需调用：
+
+```cpp
+TcpClusterTransport transport(&sys, &loop);
+transport.SetLocalNodeId("nodeA");
+transport.ConnectToNode("nodeB", "192.168.1.2", 9600);
+sys.RegisterTransport(&transport);  // 注册后 SendToRemote() 可用
+```
+
+### 20.7 后续扩展方向
 
 - **序列化优化**：`ClusterPacket.data` 改用 protobuf / flatbuffers 序列化
 - **节点发现**：通过心跳/注册中心自动发现节点
@@ -2479,7 +2573,7 @@ sysA.Send(proxyId, ActorMessage{MsgType::UserMessage, 0, -1, "hello cluster!"});
 | 1 | TestPayloadTypeSystem | `std::any` payload 的 `SetPayload`/`GetPayload`/`IsPayloadType` 功能；验证多种类型（结构体、基本类型）的类型安全传递 |
 | 2 | TestPriorityMessage | 双队列邮箱：先发 5 条普通消息再发 1 条优先级消息，验证优先级消息被先处理 |
 | 3 | TestActorMetrics | `ActorMetrics` 计数器和计时器：验证 `totalMsgProcessed`、`totalProcessTimeUs`、`maxProcessTimeUs`、`avgProcessTimeUs` 的正确性；测试 `Reset()` 方法 |
-| 4 | TestClusterProxy | `ClusterProxy` + `LoopbackTransport`：创建两个 ActorSystem 模拟两个节点，通过代理跨节点发送消息，验证按 ID 和按名字两种寻址方式 |
+| 4 | TestClusterProxy | `ClusterProxy` + `LoopbackTransport`：创建两个 ActorSystem 模拟两个节点，通过代理跨节点发送消息，验证名字寻址方式（v2 已移除 ID 寻址） |
 | 5 | TestCollectActorStatsWithMetrics | `CollectActorStats()` 完整指标：注册 Actor、处理消息后，验证 `CollectActorStats()` 返回的指标数据（`totalMsgProcessed`、时间数据、`maxMailboxSize`）的正确性 |
 | 6 | TestTcpCluster | `TcpClusterTransport` 真实 TCP 测试：两个独立的 EventLoop+ActorSystem（Node A / Node B）通过 TCP 连接，验证握手、正向消息投递（A→B）、反向确认（B→A）、ClusterPacketCodec 编解码一致性、粘包/半包处理 |
 
