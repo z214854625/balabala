@@ -78,9 +78,9 @@ public:
     int lastDamage = 0;
     int lastIntValue = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         // 使用类型安全的 GetPayload
         if (auto* p = msg.GetPayload<PlayerInfo>()) {
@@ -98,6 +98,7 @@ public:
         if (total >= 3) {
             allReceived.store(true);
         }
+        co_return;
     }
 };
 
@@ -210,14 +211,15 @@ public:
     std::atomic<bool> allDone{false};
     int expectedCount = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         processOrder.push_back(msg.data);
         int cnt = processCount.fetch_add(1) + 1;
         if (cnt >= expectedCount) {
             allDone.store(true);
         }
+        co_return;
     }
 };
 
@@ -297,9 +299,9 @@ public:
     std::atomic<bool> done{false};
     int expectedCount = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         // 模拟一些处理耗时
         if (msg.data == "slow") {
@@ -310,6 +312,7 @@ public:
         if (cnt >= expectedCount) {
             done.store(true);
         }
+        co_return;
     }
 };
 
@@ -407,14 +410,15 @@ public:
     std::atomic<bool> done{false};
     int expectedCount = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         recvCount.fetch_add(1);
         std::cout << "  [RemoteEchoActor] recv from cluster: " << msg.data << std::endl;
         if (recvCount.load() >= expectedCount && expectedCount > 0) {
             done.store(true);
         }
+        co_return;
     }
 };
 
@@ -527,14 +531,15 @@ public:
     std::atomic<bool> done{false};
     int expectedCount = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         usleep(100);  // 小延时，确保有可测量的时间
         int cnt = processCount.fetch_add(1) + 1;
         if (cnt >= expectedCount) {
             done.store(true);
         }
+        co_return;
     }
 };
 
@@ -661,9 +666,9 @@ public:
     std::string ackNodeId;
     std::string ackActorName;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         int cnt = recvCount.fetch_add(1) + 1;
         std::cout << "  [TcpReceiverActor] recv #" << cnt << ": " << msg.data << std::endl;
 
@@ -681,6 +686,7 @@ public:
         if (cnt >= expectedCount) {
             allReceived.store(true);
         }
+        co_return;
     }
 };
 
@@ -692,14 +698,15 @@ public:
     std::atomic<bool> allAcked{false};
     int expectedCount = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         int cnt = ackCount.fetch_add(1) + 1;
         std::cout << "  [TcpAckActor] recv ack #" << cnt << ": " << msg.data << std::endl;
         if (cnt >= expectedCount) {
             allAcked.store(true);
         }
+        co_return;
     }
 };
 

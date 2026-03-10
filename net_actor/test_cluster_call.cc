@@ -78,9 +78,9 @@ class EchoService : public Actor
 public:
     std::atomic<int> recvCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         int cnt = recvCount.fetch_add(1) + 1;
         std::cout << "  [NodeA:echo_service] recv #" << cnt << ": " << msg.data << std::endl;
@@ -88,6 +88,7 @@ public:
         if (msg.IsRemote()) {
             RespondRemote(msg, "echo:" + msg.data);
         }
+        co_return;
     }
 };
 
@@ -100,9 +101,9 @@ class MathService : public Actor
 public:
     std::atomic<int> recvCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         int cnt = recvCount.fetch_add(1) + 1;
         std::cout << "  [NodeA:math_service] recv #" << cnt << ": " << msg.data << std::endl;
@@ -119,6 +120,7 @@ public:
             }
             RespondRemote(msg, "result:" + std::to_string(result));
         }
+        co_return;
     }
 };
 
@@ -133,9 +135,9 @@ public:
 class LocalService : public Actor
 {
 public:
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         std::cout << "  [NodeB:local_service] recv: " << msg.data << std::endl;
 
@@ -144,6 +146,7 @@ public:
             ActorMessage response{MsgType::UserMessage, 0, -1, "local_result:" + msg.data};
             RespondToCall(msg, std::move(response));
         }
+        co_return;
     }
 };
 

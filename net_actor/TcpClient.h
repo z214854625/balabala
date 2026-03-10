@@ -18,7 +18,7 @@ class Connector;
 class EchoClientActor : public Actor
 {
 public:
-    void OnMessage(ActorMessage& msg) override;
+    ActorTask OnCoroutineMessage(ActorMessage msg) override;
 };
 
 class TcpClient

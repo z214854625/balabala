@@ -18,7 +18,7 @@ class Acceptor;
 class EchoServerActor : public Actor
 {
 public:
-    void OnMessage(ActorMessage& msg) override;
+    ActorTask OnCoroutineMessage(ActorMessage msg) override;
 };
 
 class TcpServer

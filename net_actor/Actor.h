@@ -2,7 +2,20 @@
 /**
 @auther: chencaiyu
 @date: 2025.3.1
-@brief: Actor基类，每个Actor拥有独立的邮箱(mailbox)，消息串行处理
+@brief: Actor基类（协程版），每个Actor拥有独立的邮箱(mailbox)，消息串行处理
+        集成了 C++20 协程支持（Skynet 风格服务协程），所有 Actor 天然支持 co_await
+
+核心机制：
+  1. 每条消息到达时，OnMessage() 检查 isResponse 标志：
+     - 如果是 Response（isResponse=true）→ 恢复等待该 sessionId 的协程
+     - 如果是新消息 → 调用 OnCoroutineMessage() 创建新协程
+  
+  2. OnCoroutineMessage() 是用户重写的协程函数（返回 ActorTask）：
+     - 可以使用 co_await Call(targetId, msg) 发送消息并等待响应（本地RPC）
+     - 可以使用 co_await ClusterCall(nodeId, name, msg) 跨进程RPC
+     - 可以使用 co_await Sleep(ms) 休眠
+     - 不使用 co_await 时等同于同步执行（仅需在末尾加 co_return）
+     - 挂起时 worker 线程释放，可处理其他 Actor
 
 改进记录（P0/P1/P2/P3 优化）：
  [P0] 定时器辅助：SetTimeout/SetInterval/CancelTimer（委托给ActorSystem）
@@ -12,12 +25,37 @@
  [P2] A.9 指标监控：ActorMetrics 结构，ProcessOne 内自动统计耗时和消息计数
  [P3] A.10 优先级消息：双队列（priorityMailbox_ + normalMailbox_），优先处理高优先级消息
  [P3] A.11 跨进程集群：SendToRemote/RespondRemote，便捷的跨进程发送/回复
+ [合并] 原 CoroutineActor 已合并入 Actor：所有 Actor 天然支持 co_await Call/Sleep/ClusterCall
+
+使用示例（同步 Actor，不使用 co_await）：
+  class EchoActor : public Actor {
+      ActorTask OnCoroutineMessage(ActorMessage msg) override {
+          if (msg.type == MsgType::NetworkRecv) {
+              SendToNetwork(msg.fd, msg.data.c_str(), msg.data.size());
+          }
+          co_return;
+      }
+  };
+
+使用示例（协程 Actor，使用 co_await）：
+  class GameService : public Actor {
+      ActorTask OnCoroutineMessage(ActorMessage msg) override {
+          auto resp = co_await Call(dbActorId,
+              ActorMessage{MsgType::UserMessage, 0, -1, "get:player_level"});
+          std::cout << "level = " << resp.data << std::endl;
+          co_await Sleep(100);
+          Respond(msg, ActorMessage{MsgType::UserMessage, 0, -1, "done"});
+      }
+  };
 */
 
 #include "precompiled.h"
 #include "Message.h"
+#include "Coroutine.h"
 #include "../Util/SpinLockQueue.h"
 #include <chrono>
+#include <coroutine>
+#include <unordered_map>
 
 namespace bllsll {
 
@@ -49,9 +87,14 @@ struct ActorMetrics {
 
 class Actor
 {
+    // Awaiter 需要访问内部方法
+    friend struct CallAwaiter;
+    friend struct ClusterCallAwaiter;
+    friend struct SleepAwaiter;
+
 public:
     Actor() = default;
-    virtual ~Actor() = default;
+    virtual ~Actor();
 
     uint32_t GetActorId() const { return actorId_; }
     void SetActorId(uint32_t id) { actorId_ = id; }
@@ -70,8 +113,13 @@ public:
     // 调度标记（用于ActorSystem的就绪队列去重）
     std::atomic<bool> scheduled_{false};
 
-    // 子类实现：处理消息
-    virtual void OnMessage(ActorMessage& msg) = 0;
+    // ===== 消息分发（非虚，内部使用）=====
+    // 分发逻辑：Response → 恢复协程，新消息 → 创建协程
+    void OnMessage(ActorMessage& msg);
+
+    // ===== 用户重写：协程消息处理器 =====
+    // 参数按值传递（协程可能挂起，原引用会失效）
+    virtual ActorTask OnCoroutineMessage(ActorMessage msg) = 0;
 
     // [P1] 设置邮箱高水位告警阈值（0=禁用，默认禁用）
     void SetMailboxHighWaterMark(size_t hwm) { mailboxHighWaterMark_ = hwm; }
@@ -79,6 +127,31 @@ public:
     // [P2] A.9 获取指标
     const ActorMetrics& GetMetrics() const { return metrics_; }
     ActorMetrics& GetMetrics() { return metrics_; }
+
+    // ===== Skynet 风格协程 API =====
+
+    // 类似 skynet.call()：发送消息并等待响应（本地RPC）
+    // 用法: auto resp = co_await Call(targetId, msg);
+    CallAwaiter Call(uint32_t targetId, ActorMessage&& msg);
+
+    // 类似 skynet cluster.call()：跨进程发送消息并等待响应（跨进程RPC）
+    // 注意：调用方 Actor 必须已通过 RegisterName() 注册名字！
+    // 用法: auto resp = co_await ClusterCall("nodeB", "db_service", msg);
+    ClusterCallAwaiter ClusterCall(const std::string& targetNodeId,
+                                   const std::string& targetActorName,
+                                   ActorMessage&& msg);
+
+    // 类似 skynet.ret()：响应一个 Call 请求（本地）
+    // 用法: Respond(originalMsg, responseMsg);
+    void Respond(const ActorMessage& request, ActorMessage&& response);
+
+    // 类似 skynet.sleep()：协程休眠
+    // 用法: co_await Sleep(100);  // 休眠 100ms
+    SleepAwaiter Sleep(int ms);
+
+    // 优雅关停：销毁所有未完成的协程帧，清理等待映射
+    // 由 ActorSystem::Stop() 在排空邮箱后调用，防止协程帧泄漏
+    void DestroyAllCoroutines();
 
 protected:
     // 发消息给其他Actor
@@ -129,8 +202,19 @@ private:
     bllsll::SpinLockQueue<ActorMessage> priorityMailbox_;   // 高优先级队列
     bllsll::SpinLockQueue<ActorMessage> normalMailbox_;     // 普通队列
 
-    // 向后兼容：旧代码中 mailbox_ 作为 normalMailbox_ 的别名
-    // 注意：mailbox_ 已被替换为 normalMailbox_ + priorityMailbox_
+    // ===== 协程管理（原 CoroutineActor 功能）=====
+    // 分配唯一 sessionId
+    uint32_t AllocSession() { return nextSessionId_++; }
+    // 存储挂起的协程句柄
+    void StoreWaiting(uint32_t session, std::coroutine_handle<> h);
+    // 恢复挂起的协程（由 OnMessage 在收到 Response 时调用）
+    bool ResumeWaiting(uint32_t session, ActorMessage&& response);
+
+    uint32_t nextSessionId_ = 1;
+    // sessionId → 挂起的协程句柄
+    std::unordered_map<uint32_t, std::coroutine_handle<>> waitMap_;
+    // sessionId → 响应消息（供 await_resume 取出）
+    std::unordered_map<uint32_t, ActorMessage> responseMap_;
 };
 
 } // namespace bllsll

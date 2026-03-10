@@ -1,8 +1,34 @@
+/**
+ * @file Actor.cc
+ * @brief Actor 实现（已合并原 CoroutineActor 功能）
+ *
+ * 包含：
+ *   - 邮箱管理（PushMessage / ProcessOne / IsMailboxEmpty）
+ *   - 消息分发（OnMessage：Response → 恢复协程，新消息 → 创建协程）
+ *   - Actor 间通信（SendToActor / RespondToCall / SendToNetwork）
+ *   - 协程管理（Call / ClusterCall / Sleep / StoreWaiting / ResumeWaiting）
+ *   - Awaiter 实现（CallAwaiter / ClusterCallAwaiter / SleepAwaiter）
+ *   - 定时器 / 命名 / Link / 集群辅助方法
+ */
+
 #include "Actor.h"
 #include "ActorSystem.h"
 #include "EventLoop.h"
 
 using namespace bllsll;
+
+// ================================================================
+//  析构函数 — 清理所有未完成的协程帧
+// ================================================================
+
+Actor::~Actor()
+{
+    DestroyAllCoroutines();
+}
+
+// ================================================================
+//  邮箱管理
+// ================================================================
 
 void Actor::PushMessage(ActorMessage&& msg)
 {
@@ -76,6 +102,94 @@ size_t Actor::GetMailboxSize() const
 {
     return priorityMailbox_.size() + normalMailbox_.size();
 }
+
+// ================================================================
+//  消息分发（合并自 CoroutineActor::OnMessage）
+// ================================================================
+
+void Actor::OnMessage(ActorMessage& msg)
+{
+    if (msg.isResponse && msg.sessionId > 0) {
+        // 这是一个 Response 消息 — 恢复等待的协程
+        if (!ResumeWaiting(msg.sessionId, std::move(msg))) {
+            std::cout << "[Actor:" << actorId_
+                      << "] no coroutine waiting for session=" << msg.sessionId << std::endl;
+        }
+    } else {
+        // 新消息 — 创建新协程处理
+        // 参数按值传递，因为协程可能挂起，原引用会在 ProcessOne() 返回后失效
+        OnCoroutineMessage(std::move(msg));
+    }
+}
+
+// ================================================================
+//  Skynet 风格协程 API
+// ================================================================
+
+CallAwaiter Actor::Call(uint32_t targetId, ActorMessage&& msg)
+{
+    return CallAwaiter{this, targetId, std::move(msg)};
+}
+
+ClusterCallAwaiter Actor::ClusterCall(const std::string& targetNodeId,
+                                       const std::string& targetActorName,
+                                       ActorMessage&& msg)
+{
+    return ClusterCallAwaiter{this, targetNodeId, targetActorName, std::move(msg)};
+}
+
+void Actor::Respond(const ActorMessage& request, ActorMessage&& response)
+{
+    // 委托给 RespondToCall
+    RespondToCall(request, std::move(response));
+}
+
+SleepAwaiter Actor::Sleep(int ms)
+{
+    return SleepAwaiter{this, ms};
+}
+
+// ================================================================
+//  协程管理
+// ================================================================
+
+void Actor::StoreWaiting(uint32_t session, std::coroutine_handle<> h)
+{
+    waitMap_[session] = h;
+}
+
+bool Actor::ResumeWaiting(uint32_t session, ActorMessage&& response)
+{
+    auto it = waitMap_.find(session);
+    if (it == waitMap_.end()) {
+        return false;
+    }
+    auto h = it->second;
+    waitMap_.erase(it);
+
+    // 先存储响应，再 resume，这样 await_resume() 可以取到
+    responseMap_[session] = std::move(response);
+    h.resume();  // 协程从 co_await 处继续执行
+
+    return true;
+}
+
+void Actor::DestroyAllCoroutines()
+{
+    for (auto& [session, h] : waitMap_) {
+        if (h && !h.done()) {
+            std::cout << "[Actor:" << actorId_
+                      << "] destroying pending coroutine session=" << session << std::endl;
+            h.destroy();
+        }
+    }
+    waitMap_.clear();
+    responseMap_.clear();
+}
+
+// ================================================================
+//  Actor 间通信
+// ================================================================
 
 void Actor::SendToActor(uint32_t targetId, ActorMessage&& msg)
 {
@@ -206,4 +320,93 @@ bool Actor::RespondRemote(const ActorMessage& request, const std::string& respon
     resp.isResponse = true;
     return system_->SendToRemote(request.sourceNodeId, request.sourceActorName,
                                   std::move(resp));
+}
+
+// ================================================================
+//  CallAwaiter 实现
+// ================================================================
+
+void CallAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    // 1. 分配 sessionId
+    sessionId = actor->AllocSession();
+
+    // 2. 存储协程句柄（等待恢复）
+    actor->StoreWaiting(sessionId, h);
+
+    // 3. 设置消息的 sessionId，发送给目标 Actor
+    msg.sessionId = sessionId;
+    actor->SendToActor(targetId, std::move(msg));
+
+    // 4. 返回后协程挂起，worker 线程释放
+}
+
+ActorMessage CallAwaiter::await_resume()
+{
+    // 从 responseMap_ 取出响应消息
+    auto it = actor->responseMap_.find(sessionId);
+    ActorMessage result;
+    if (it != actor->responseMap_.end()) {
+        result = std::move(it->second);
+        actor->responseMap_.erase(it);
+    }
+    return result;
+}
+
+// ================================================================
+//  ClusterCallAwaiter 实现 — 跨进程协程 RPC
+// ================================================================
+
+void ClusterCallAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    // 1. 分配 sessionId
+    sessionId = actor->AllocSession();
+
+    // 2. 存储协程句柄（等待恢复）
+    actor->StoreWaiting(sessionId, h);
+
+    // 3. 设置消息的 sessionId，通过 SendToRemote 发送到远端节点
+    msg.sessionId = sessionId;
+    actor->SendToRemote(targetNodeId, targetActorName, std::move(msg));
+
+    // 4. 返回后协程挂起，worker 线程释放
+}
+
+ActorMessage ClusterCallAwaiter::await_resume()
+{
+    // 从 responseMap_ 取出响应消息（与 CallAwaiter::await_resume 完全相同）
+    auto it = actor->responseMap_.find(sessionId);
+    ActorMessage result;
+    if (it != actor->responseMap_.end()) {
+        result = std::move(it->second);
+        actor->responseMap_.erase(it);
+    }
+    return result;
+}
+
+// ================================================================
+//  SleepAwaiter 实现
+//  [P0] 改用 TimerManager（ActorSystem::SetTimeout），
+//       不再启动 detached thread
+// ================================================================
+
+void SleepAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    // 1. 分配 sessionId
+    sessionId = actor->AllocSession();
+
+    // 2. 存储协程句柄
+    actor->StoreWaiting(sessionId, h);
+
+    // 3. 通过 TimerManager 注册一次性定时器
+    //    定时器到期后会发送一个 isResponse=true 的消息，触发协程恢复
+    auto* sys = actor->GetSystem();
+    if (sys) {
+        ActorMessage wakeup{MsgType::UserMessage, 0, -1, ""};
+        wakeup.sessionId = sessionId;
+        wakeup.isResponse = true;
+        sys->SetTimeout(actor->GetActorId(), milliseconds, std::move(wakeup));
+    }
+
+    // 4. 返回后协程挂起
 }

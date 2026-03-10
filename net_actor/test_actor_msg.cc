@@ -62,7 +62,7 @@ public:
     std::atomic<int> connCount{0};
     std::atomic<int> ackCount{0};   // 收到 ProcessorActor 确认的次数
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
         switch (msg.type) {
         case MsgType::Connected:
@@ -94,6 +94,7 @@ public:
         default:
             break;
         }
+        co_return;
     }
 };
 
@@ -109,9 +110,9 @@ public:
     uint32_t responderActorId = 0;
     std::atomic<int> processCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         processCount.fetch_add(1);
         // 加工数据：添加 "processed:" 前缀
@@ -138,9 +139,9 @@ class ResponderActor : public Actor
 public:
     std::atomic<int> respondCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         respondCount.fetch_add(1);
         std::cout << "[ResponderActor] sending response to fd=" << msg.fd
@@ -169,7 +170,7 @@ public:
     std::atomic<bool> allReceived{false};
     bllsll::SpinLockQueue<std::string> responses;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
         switch (msg.type) {
         case MsgType::Connected:
@@ -196,6 +197,7 @@ public:
         default:
             break;
         }
+        co_return;
     }
 };
 

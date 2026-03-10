@@ -44,9 +44,9 @@ public:
     std::atomic<int> recvCount{0};   // 收到 pong 的次数
     std::atomic<bool> done{false};   // 是否完成
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         if (msg.data == "start") {
             // 发起第一轮 ping
@@ -70,9 +70,9 @@ class PongActor : public Actor
 public:
     std::atomic<int> recvCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         if (msg.data.substr(0, 4) == "ping") {
             recvCount.fetch_add(1);
@@ -148,9 +148,9 @@ public:
     uint32_t nextActorId = 0;        // 下游 Actor ID
     std::atomic<int> recvCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         recvCount.fetch_add(1);
         // 转发给下游，保留原始数据
         if (nextActorId > 0) {
@@ -166,9 +166,9 @@ public:
     std::atomic<bool> done{false};
     int expectCount = 0;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         int cnt = recvCount.fetch_add(1) + 1;
         if (cnt >= expectCount) {
             done.store(true);
@@ -251,9 +251,9 @@ public:
     std::vector<uint32_t> receiverIds;
     std::atomic<int> sendCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage && msg.data != "broadcast_start") return;
+        if (msg.type != MsgType::UserMessage && msg.data != "broadcast_start") co_return;
 
         // 收到触发消息后，向所有 receiver 广播 BROADCAST_MSG_COUNT 条消息
         for (int i = 0; i < BROADCAST_MSG_COUNT; ++i) {
@@ -271,9 +271,9 @@ class ReceiverActor : public Actor
 public:
     std::atomic<int> recvCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         recvCount.fetch_add(1);
     }
 };
@@ -361,9 +361,9 @@ public:
     std::vector<uint32_t> peerIds;
     std::atomic<bool> startSending{false};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         if (msg.data == "go") {
             // 收到 go 信号后，向所有 peer 发送消息

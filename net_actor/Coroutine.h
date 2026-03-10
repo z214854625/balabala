@@ -16,6 +16,8 @@
           RespondToCall(req, resp)        -- 响应调用者（本地）
           RespondRemote(req, data)        -- 响应调用者（跨进程）
           co_await Sleep(ms)              -- 协程休眠
+
+[合并] 原 CoroutineActor 已合并入 Actor，所有 Actor 天然支持协程
 */
 
 #include <coroutine>
@@ -23,8 +25,8 @@
 
 namespace bllsll {
 
-// 前置声明
-class CoroutineActor;
+// 前置声明（合并后统一使用 Actor）
+class Actor;
 
 // ============================================================
 //  ActorTask: 协程返回类型（fire-and-forget）
@@ -64,7 +66,7 @@ struct ActorTask
 // ============================================================
 struct CallAwaiter
 {
-    CoroutineActor* actor;
+    Actor* actor;
     uint32_t targetId;
     ActorMessage msg;
     uint32_t sessionId = 0;
@@ -96,7 +98,7 @@ struct CallAwaiter
 // ============================================================
 struct ClusterCallAwaiter
 {
-    CoroutineActor* actor;
+    Actor* actor;
     std::string targetNodeId;
     std::string targetActorName;
     ActorMessage msg;
@@ -125,7 +127,7 @@ struct ClusterCallAwaiter
 // ============================================================
 struct SleepAwaiter
 {
-    CoroutineActor* actor;
+    Actor* actor;
     int milliseconds;
     uint32_t sessionId = 0;
 

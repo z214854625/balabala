@@ -5,7 +5,7 @@
 using namespace bllsll;
 using namespace std;
 
-void EchoServerActor::OnMessage(ActorMessage& msg)
+ActorTask EchoServerActor::OnCoroutineMessage(ActorMessage msg)
 {
     switch (msg.type) {
     case MsgType::Connected:
@@ -23,6 +23,7 @@ void EchoServerActor::OnMessage(ActorMessage& msg)
     default:
         break;
     }
+    co_return;
 }
 
 void TcpServer::Start(int port)

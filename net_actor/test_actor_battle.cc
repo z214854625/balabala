@@ -92,12 +92,12 @@ public:
     std::atomic<int> totalAttacks{0};
     std::string winner;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         auto parts = Split(msg.data, ':');
-        if (parts.empty()) return;
+        if (parts.empty()) co_return;
 
         if (parts[0] == "start_battle" && parts.size() >= 5) {
             // "start_battle:nameA:idA:nameB:idB"
@@ -131,7 +131,7 @@ public:
             // "attack:attacker_name:skill_name"
             if (!battleActive_) {
                 std::cout << "[BattleActor] battle not active, ignoring attack" << std::endl;
-                return;
+                co_return;
             }
 
             totalAttacks.fetch_add(1);
@@ -185,6 +185,7 @@ public:
                     ActorMessage{MsgType::UserMessage, 0, -1, "you_lose"});
             }
         }
+        co_return;
     }
 };
 
@@ -211,12 +212,12 @@ public:
 
     PlayerActor(const std::string& name) : name_(name) {}
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         auto parts = Split(msg.data, ':');
-        if (parts.empty()) return;
+        if (parts.empty()) co_return;
 
         if (parts[0] == "battle_started") {
             inBattle.store(true);
@@ -224,7 +225,7 @@ public:
 
         } else if (parts[0] == "do_attack") {
             // 收到外部指令，发起攻击（发给 BattleActor）
-            if (!inBattle.load()) return;
+            if (!inBattle.load()) co_return;
             std::string skill = parts.size() >= 2 ? parts[1] : "normal_attack";
             std::cout << "[" << name_ << "] attacking with [" << skill << "]..." << std::endl;
 
@@ -264,6 +265,7 @@ public:
             inBattle.store(false);
             std::cout << "[" << name_ << "] I LOSE..." << std::endl;
         }
+        co_return;
     }
 
     // 发起攻击（通过消息触发，可从任意线程调用）

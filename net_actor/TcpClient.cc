@@ -5,7 +5,7 @@
 using namespace bllsll;
 using namespace std;
 
-void EchoClientActor::OnMessage(ActorMessage& msg)
+ActorTask EchoClientActor::OnCoroutineMessage(ActorMessage msg)
 {
     switch (msg.type) {
     case MsgType::Connected:
@@ -23,6 +23,7 @@ void EchoClientActor::OnMessage(ActorMessage& msg)
     default:
         break;
     }
+    co_return;
 }
 
 void TcpClient::Start(int port, const std::string strIp)

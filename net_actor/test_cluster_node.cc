@@ -74,9 +74,9 @@ class EchoServiceActor : public Actor
 public:
     std::atomic<int> recvCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         int cnt = recvCount.fetch_add(1) + 1;
         std::cout << "[NodeA:echo_service] recv #" << cnt << ": " << msg.data
@@ -87,6 +87,7 @@ public:
         if (msg.IsRemote()) {
             RespondRemote(msg, "echo:" + msg.data);
         }
+        co_return;
     }
 };
 
@@ -101,9 +102,9 @@ class CounterServiceActor : public Actor
 public:
     std::atomic<int> counter{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         if (msg.data == "get_count") {
             std::cout << "[NodeA:counter_service] get_count request, count="
@@ -116,6 +117,7 @@ public:
             int cnt = counter.fetch_add(1) + 1;
             std::cout << "[NodeA:counter_service] recv #" << cnt << ": " << msg.data << std::endl;
         }
+        co_return;
     }
 };
 
@@ -135,9 +137,9 @@ public:
     std::atomic<int> lastCount{-1};
     bllsll::SpinLockQueue<std::string> responses;
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         std::cout << "[NodeB:result_collector] recv: " << msg.data << std::endl;
         responses.push(msg.data);
@@ -148,6 +150,7 @@ public:
             countResultRecv.fetch_add(1);
             lastCount.store(std::stoi(msg.data.substr(6)));
         }
+        co_return;
     }
 
     bool WaitForEchos(int expected, int timeoutMs = 10000)

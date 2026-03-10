@@ -242,7 +242,7 @@ public:
 
     const RemoteActorRef& GetRemoteRef() const { return remote_; }
 
-    void OnMessage(ActorMessage& msg) override;
+    ActorTask OnCoroutineMessage(ActorMessage msg) override;
 
 private:
     RemoteActorRef remote_;
@@ -372,14 +372,14 @@ public:
     {
     }
 
-    void OnMessage(ActorMessage& msg) override;
+    ActorTask OnCoroutineMessage(ActorMessage msg) override;
 
 private:
     // 处理一个解码后的集群数据包
     void handleDecodedPacket(const ClusterPacket& pkt, int fd);
 
     TcpClusterTransport* transport_;
-    // per-fd 接收缓冲区（仅在 OnMessage 中串行访问，无需锁）
+    // per-fd 接收缓冲区（仅在 OnCoroutineMessage 中串行访问，无需锁）
     std::unordered_map<int, std::string> recvBuffers_;
 };
 

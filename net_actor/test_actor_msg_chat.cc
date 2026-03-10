@@ -53,7 +53,7 @@ public:
     std::atomic<int> recvCount{0}; // 收到的网络消息数
     std::atomic<int> chatRecvCount{0}; // 收到的聊天转发数
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
         switch (msg.type) {
         case MsgType::Connected:
@@ -109,6 +109,7 @@ public:
         default:
             break;
         }
+        co_return;
     }
 };
 
@@ -123,7 +124,7 @@ public:
     std::atomic<int> connCount{0};
     std::atomic<int> broadcastCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
         switch (msg.type) {
         case MsgType::Connected: {
@@ -187,6 +188,7 @@ public:
         default:
             break;
         }
+        co_return;
     }
 };
 
@@ -201,7 +203,7 @@ public:
     std::atomic<int> recvCount{0};
     bllsll::SpinLockQueue<std::string> responses;  // 收到的所有响应
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
         switch (msg.type) {
         case MsgType::Connected:
@@ -225,6 +227,7 @@ public:
         default:
             break;
         }
+        co_return;
     }
 
     // 等待收到指定数量的消息

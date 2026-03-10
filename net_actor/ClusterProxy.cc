@@ -12,9 +12,9 @@ using namespace std;
 //  收到消息后，通过 transport 转发到远程节点
 // ================================================================
 
-void ClusterProxy::OnMessage(ActorMessage& msg)
+ActorTask ClusterProxy::OnCoroutineMessage(ActorMessage msg)
 {
-    if (!transport_) return;
+    if (!transport_) co_return;
 
     // 自动查找发送方 Actor 的注册名字（用于回程路由）
     std::string senderName;
@@ -34,6 +34,7 @@ void ClusterProxy::OnMessage(ActorMessage& msg)
     if (!transport_->SendPacket(pkt)) {
         std::cerr << "[ClusterProxy] failed to send to " << remote_.ToString() << std::endl;
     }
+    co_return;
 }
 
 // ================================================================
@@ -208,7 +209,7 @@ size_t ClusterPacketCodec::Decode(const char* data, size_t len, ClusterPacket& o
 
 static const std::string CLUSTER_HANDSHAKE_MAGIC = "CLUSTER_HANDSHAKE";
 
-void ClusterGatewayActor::OnMessage(ActorMessage& msg)
+ActorTask ClusterGatewayActor::OnCoroutineMessage(ActorMessage msg)
 {
     switch (msg.type) {
     case MsgType::Connected: {
@@ -253,6 +254,7 @@ void ClusterGatewayActor::OnMessage(ActorMessage& msg)
     default:
         break;
     }
+    co_return;
 }
 
 void ClusterGatewayActor::handleDecodedPacket(const ClusterPacket& pkt, int fd)

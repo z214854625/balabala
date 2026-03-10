@@ -62,9 +62,9 @@ public:
     std::unordered_map<std::string, std::string> db_;
     std::atomic<int> queryCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
 
         if (msg.data.find("get:") == 0) {
             queryCount.fetch_add(1);
@@ -86,6 +86,7 @@ public:
                 std::cout << "[DatabaseActor] set '" << key << "' = '" << value << "'" << std::endl;
             }
         }
+        co_return;
     }
 };
 
