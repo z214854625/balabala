@@ -76,5 +76,19 @@
         "resumable": "cpp",
         "xthread": "cpp",
         "queue": "cpp"
-    }
+    },
+    "claudeCode.environmentVariables": [
+        {
+            "name": "ANTHROPIC_BASE_URL",
+            "value": "https://chat-test.q1.com/v1"
+        },
+        {
+            "name": "ANTHROPIC_AUTH_TOKEN",
+            "value": "sk-fd98f98c6fb3e9d9bcf017b4a37a2a43c7334ae5"
+        },
+        {
+            "name": "ANTHROPIC_MODEL",
+            "value": "claude-opus-4-7"
+        }
+    ]
 }

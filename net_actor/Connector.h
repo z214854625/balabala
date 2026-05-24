@@ -28,6 +28,8 @@ public:
     virtual void HandleAccept(int listenFd, uint32_t events) {}
     //getfd
     virtual int GetFd(){ return socket_; }
+    // [Send fast-path] 连接尚未建立时不允许直接 write
+    virtual bool CanWriteDirectly() const override { return !connecting_; }
 
 protected:
     void _Connect(int port, const std::string& strIp);

@@ -61,9 +61,9 @@ void Connector::HandleWrite(int fd, uint32_t events)
             actorSys->Send(ownerActorId_, ActorMessage{MsgType::Connected, 0, fd, ""});
         }
 
-        // 检查连接建立前是否有Send()数据入队
+        // 检查连接建立前是否有 Send() 数据入队（已在 loop 线程，安全访问 outputBuffer_）
         // 此时已在 loop 线程（HandleWrite 由 EventLoop 触发），ModifyEventKeepCallback 同步执行
-        if (!sendMQ_.empty() || !lastMsgCache_.empty()) {
+        if (!outputBuffer_.Empty()) {
             loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
         } else {
             // 切换到读模式，等待服务端数据（Send() 会自动添加 EPOLLOUT）
