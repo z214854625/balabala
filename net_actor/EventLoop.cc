@@ -107,6 +107,21 @@ void EventLoop::QueueInLoop(PendingTask&& task)
 
 void EventLoop::runPendingTasks()
 {
+    /**
+     * 如果是
+     * ModifyEvent(RW)
+     * ModifyEvent(RW)
+     * ModifyEvent(R) 这种情况，会出现最后最后epoll的状态是R，会导致数据发布出去吗？
+     * 实际上是不会的，因为设置成R状态，只有再epoll的HandleWrite都写完时，
+     * 才会设置成R状态，所以不存在有数据没写完但是状态为R的情况；
+     * 还有另外一种情况是handlewrite的同时，外面的worker也再send，这时候如果RW先触发，然后再触发R，
+     * 就会出现消息发不出去的情况，但是handleWrite的R在eventloop的线程里面是同步的，所以实际上不存在
+     * 先RW再R的情况，要么R+RW(没问题)，要么RW->handleWrite->R(没问题)；
+     * 
+     * 以上问题虽然没有问题，但是目前代码还是已经优化过了。
+     * send()时将sendMQ_.push和ModifyEvent都放到eventloop中执行，
+     * 就不存在竞争问题了。
+     */
     std::vector<PendingTask> tasks;
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(pendingLock_);

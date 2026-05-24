@@ -1,6 +1,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <cassert>
 #include "ConnectionBase.h"
 #include "EventLoop.h"
 #include "ActorSystem.h"
@@ -30,14 +31,27 @@ void ConnectionBase::Send(const char* pData, int nLen)
         std::cerr << "ConnectionBase::Send invalid socket. nLen=" << nLen << std::endl;
         return;
     }
-    sendMQ_.push(std::string(pData, nLen));
-    // 跨线程调用时直接走 ModifyEventKeepCallback（内部 RunInLoop），
-    // 避免 worker 线程与 EventLoop 线程并发操作 epoll_ctl/callbacks_
-    loop_->ModifyEventKeepCallback(socket_, EPOLL_EVENTS_RW);
+
+    // 将 push + ModifyEvent 整体投递到 loop 线程串行执行，与 HandleWrite 完全互斥。
+    // 这样可以彻底消除以下 race：
+    //   worker push 后 queue task_RW，loop HandleWrite 看到空队列后 sync ModifyEvent(R)
+    //   → 最终状态 R 但 sendMQ_ 已有数据 → 卡死
+    // 现在 push 和 ModifyEvent 都在 loop 线程，HandleWrite 也在 loop 线程，三者串行。
+    int fd = socket_;
+    std::string data(pData, nLen);
+    loop_->RunInLoop([this, fd, data = std::move(data)]() mutable {
+        // 此时已在 loop 线程，与 HandleWrite 互斥
+        sendMQ_.push(std::move(data));
+        // 直接同步开 EPOLLOUT（IsInLoopThread=true，ModifyEventKeepCallback 同步执行）
+        loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
+    });
 }
 
 void ConnectionBase::HandleRead(int fd, uint32_t events)
 {
+    // 不变量：HandleRead 必须在 loop 线程执行（由 EventLoop 的 cb 调用）
+    assert(loop_->IsInLoopThread() && "HandleRead must be called in loop thread");
+
     // ET 模式下需要一次读到 EAGAIN
     char buffer[NET_BUFF_SIZE];
     while (true) {
@@ -79,6 +93,12 @@ void ConnectionBase::HandleRead(int fd, uint32_t events)
 
 void ConnectionBase::HandleWrite(int fd, uint32_t events)
 {
+    // 不变量：HandleWrite 必须在 loop 线程执行
+    // 这条不变量是 Send 路径正确性的根基——
+    // 一旦在 worker 线程触发，ModifyEvent(R) 会进 pendingTasks_，
+    // 与 worker 投的 ModifyEvent(RW) 顺序不定，可能被覆盖造成数据卡死。
+    assert(loop_->IsInLoopThread() && "HandleWrite must be called in loop thread");
+
     while (!sendMQ_.empty() || !lastMsgCache_.empty()) {
         std::string strMsg;
         if (!lastMsgCache_.empty()) {
@@ -86,8 +106,9 @@ void ConnectionBase::HandleWrite(int fd, uint32_t events)
         } else {
             auto msg = sendMQ_.pop();
             if (!msg) {
-                // 并发：另一个 push 在 empty 检查后才完成，下一轮再来
-                continue;
+                // 队列瞬态空：因为 push 由 RunInLoop 串行投递，理论上不会发生。
+                // 保险起见仍处理：跳出本轮，由后续 EPOLLOUT 重新驱动。
+                break;
             }
             strMsg = std::move(*msg);
         }
@@ -107,7 +128,7 @@ void ConnectionBase::HandleWrite(int fd, uint32_t events)
                     if (len > 0) {
                         lastMsgCache_.assign(pData + offset, len);
                     }
-                    // 仍需继续监听写事件，由 EventLoop 在 loop 线程修改 epoll
+                    // 仍需继续监听写事件（同步执行，因为已在 loop 线程）
                     loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
                     return;
                 } else {
@@ -123,6 +144,9 @@ void ConnectionBase::HandleWrite(int fd, uint32_t events)
             }
         }
     }
-    // 全部写完，恢复只读监听（EPOLLOUT 会在下次 Send 时再加回来）
+    // 全部写完，恢复只读监听。
+    // 注意：因为 Send 的 push + ModifyEvent(RW) 已经整体投递到 loop 线程，
+    // 与本函数串行执行，所以不存在"sendMQ_ 误判为空"的 race——
+    // 只要本函数看到 sendMQ_ 空，那它就是真的空，可以安全地切回 R。
     loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_R);
 }
