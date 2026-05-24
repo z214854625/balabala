@@ -46,7 +46,7 @@ void Connector::HandleWrite(int fd, uint32_t events)
         int err = 0;
         socklen_t errLen = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errLen) < 0 || err != 0) {
-            std::cout << "Connector connect failed! fd=" << fd << ", err=" << err << std::endl;
+            std::cerr << "Connector connect failed! fd=" << fd << ", err=" << err << std::endl;
             loop_->RemoveEvent(fd);
             close(socket_);
             socket_ = -1;
@@ -62,11 +62,12 @@ void Connector::HandleWrite(int fd, uint32_t events)
         }
 
         // 检查连接建立前是否有Send()数据入队
+        // 此时已在 loop 线程（HandleWrite 由 EventLoop 触发），ModifyEventKeepCallback 同步执行
         if (!sendMQ_.empty() || !lastMsgCache_.empty()) {
-            loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_RW);
+            loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
         } else {
-            // 切换到读模式，等待服务端数据（Send()会自动添加EPOLLOUT）
-            loop_->GetPoller()->ModifyEvent(fd, EPOLL_EVENTS_R);
+            // 切换到读模式，等待服务端数据（Send() 会自动添加 EPOLLOUT）
+            loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_R);
         }
         return;
     }
@@ -130,7 +131,7 @@ void Connector::_Connect(int port, const std::string& strIp)
             actorSys->BindFdToActor(socket_, ownerActorId_);
             actorSys->Send(ownerActorId_, ActorMessage{MsgType::Connected, 0, socket_, ""});
         }
-        loop_->GetPoller()->ModifyEvent(socket_, EPOLL_EVENTS_R);
+        loop_->ModifyEventKeepCallback(socket_, EPOLL_EVENTS_R);
     }
     // 如果connecting_==true，HandleWrite中EPOLLOUT触发时会检查连接结果并回调
 }
