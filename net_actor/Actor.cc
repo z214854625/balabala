@@ -221,7 +221,9 @@ void Actor::RespondToCall(const ActorMessage& request, ActorMessage&& response)
 void Actor::SendToNetwork(int fd, const char* pData, int nLen)
 {
     if (system_) {
-        auto* loop = system_->GetEventLoop();
+        // [2026.5 多 Reactor] 按 fd 查找对应 EventLoop（SubReactor 模式下 fd 分布在多个 loop）
+        // 兼容：单 Reactor 时 GetEventLoopByFd 回退返回主 loop_
+        auto* loop = system_->GetEventLoopByFd(fd);
         if (loop) {
             auto* pConn = loop->GetConnection(fd);
             if (pConn) {

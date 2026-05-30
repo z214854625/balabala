@@ -12,12 +12,18 @@
 namespace bllsll {
 
 class EventLoop;
+class EventLoopThreadPool;
 
 class Acceptor : public IConnection
 {
 public:
     Acceptor(int port, EventLoop* loop, uint32_t listenerActorId);
     ~Acceptor();
+
+    // [2026.5 多 Reactor] 设置 SubReactor 线程池。
+    // 若设置且池非空，新连接 Round-Robin 派发到 sub loop；
+    // 否则新连接仍在主 loop 上（保持单 Reactor 行为）
+    void SetThreadPool(EventLoopThreadPool* pool) { threadPool_ = pool; }
 
     //发送消息（Acceptor不需要发送）
     virtual void Send(const char* pData, int nLen) {}
@@ -35,7 +41,8 @@ protected:
 
 private:
     int socket_;
-    EventLoop* loop_;
+    EventLoop* loop_;                       // 主 loop（Acceptor 自己所在的 loop）
+    EventLoopThreadPool* threadPool_ = nullptr;  // [2026.5] SubReactor 池（可选）
     uint32_t listenerActorId_;  // 通知新连接的目标Actor
 };
 

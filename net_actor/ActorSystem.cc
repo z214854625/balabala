@@ -180,10 +180,22 @@ void ActorSystem::BindFdToActor(int fd, uint32_t actorId)
     std::cout << "BindFdToActor fd=" << fd << ", actorId=" << actorId << std::endl;
 }
 
+void ActorSystem::BindFdToActor(int fd, uint32_t actorId, EventLoop* loop)
+{
+    bllsll::LockGuard<bllsll::SpinLock> lock(fdMapLock_);
+    fdToActor_[fd] = actorId;
+    if (loop) {
+        fdToLoop_[fd] = loop;
+    }
+    std::cout << "BindFdToActor fd=" << fd << ", actorId=" << actorId
+              << ", loop=" << loop << std::endl;
+}
+
 void ActorSystem::UnbindFd(int fd)
 {
     bllsll::LockGuard<bllsll::SpinLock> lock(fdMapLock_);
     fdToActor_.erase(fd);
+    fdToLoop_.erase(fd);
     std::cout << "UnbindFd fd=" << fd << std::endl;
 }
 
@@ -195,6 +207,17 @@ uint32_t ActorSystem::GetActorIdByFd(int fd)
         return 0;
     }
     return it->second;
+}
+
+EventLoop* ActorSystem::GetEventLoopByFd(int fd)
+{
+    bllsll::LockGuard<bllsll::SpinLock> lock(fdMapLock_);
+    auto it = fdToLoop_.find(fd);
+    if (it != fdToLoop_.end()) {
+        return it->second;
+    }
+    // 兼容单 Reactor 模式：未注册映射时回退到主 loop_
+    return loop_;
 }
 
 void ActorSystem::SendByFd(int fd, ActorMessage&& msg)

@@ -73,8 +73,13 @@ public:
 
     // ===== fd到actorId的映射管理 =====
     void BindFdToActor(int fd, uint32_t actorId);
+    // [2026.5 多 Reactor] 同时绑定 fd 所属的 EventLoop。SubReactor 路径调用。
+    // 旧路径未传 loop 时回退使用主 loop_
+    void BindFdToActor(int fd, uint32_t actorId, EventLoop* loop);
     void UnbindFd(int fd);
     uint32_t GetActorIdByFd(int fd);
+    // [2026.5 多 Reactor] 查 fd 所属的 EventLoop（未绑定则返回主 loop_，兼容单 Reactor）
+    EventLoop* GetEventLoopByFd(int fd);
     // 通过fd发送消息（内部查找绑定的actorId）
     void SendByFd(int fd, ActorMessage&& msg);
 
@@ -134,6 +139,8 @@ private:
     // fd -> actorId映射
     bllsll::SpinLock fdMapLock_;
     std::unordered_map<int, uint32_t> fdToActor_;
+    // [2026.5 多 Reactor] fd -> EventLoop 映射（用于 SubReactor 模式下按 fd 找 loop）
+    std::unordered_map<int, EventLoop*> fdToLoop_;
 
     // 工作线程
     std::vector<std::thread> workers_;
