@@ -19,6 +19,39 @@ ConnectionBase::~ConnectionBase()
 {
 }
 
+// [2026.5] 私有辅助：在 loop 线程内尝试直发，发不完进 outputBuffer_
+// fast-path 与 slow-path（大/小包）共用此函数，避免 write 循环 + 兜底逻辑重复。
+// 必须在 loop 线程内调用。
+void ConnectionBase::sendInLoop(int fd, const char* p, size_t len)
+{
+    assert(loop_->IsInLoopThread() && "sendInLoop must be called in loop thread");
+
+    size_t offset = 0;
+    if (outputBuffer_.Empty() && CanWriteDirectly()) {
+        while (offset < len) {
+            ssize_t n = ::write(fd, p + offset, len - offset);
+            if (n > 0) {
+                offset += n;
+            } else if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                std::cerr << "ConnectionBase::sendInLoop write failed! fd=" << fd
+                          << ", errno=" << errno << std::endl;
+                return;
+            } else {
+                // n == 0 极少见，谨慎退出避免死循环
+                break;
+            }
+        }
+    }
+    if (offset < len) {
+        // 未发完，剩余字节入 outputBuffer_ + 开 EPOLLOUT
+        outputBuffer_.Append(p + offset, len - offset);
+        loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
+    }
+    // 全部写完不需改 epoll（此时通常已是 R 状态）
+}
+
 void ConnectionBase::Send(const char* pData, int nLen)
 {
     // 入参校验：避免 nullptr/非法长度引发崩溃
@@ -32,78 +65,37 @@ void ConnectionBase::Send(const char* pData, int nLen)
         return;
     }
 
-    // ============================================================
-    //  Fast-path: 已在 loop 线程 + 无积压 + 可直发
-    //    → 直接尝试 write socket，零 std::string 构造、零 task 入队、
-    //      零 wakeup 系统调用。完全发完即可立即返回；只有部分发完时才把
-    //      剩余字节 Append 到 outputBuffer_ 等下次 EPOLLOUT。
-    //
-    //  Slow-path: 跨线程 / 已有积压 / 连接未建立
-    //    → 把"Append + ModifyEvent(RW)"打包成 task 投递到 loop 线程，
-    //      与 HandleWrite 串行执行，消除并发 race。
-    // ============================================================
     int fd = socket_;
-    if (loop_->IsInLoopThread() && outputBuffer_.Empty() && CanWriteDirectly()) {
-        // ---- Fast-path ----
-        ssize_t written = 0;
-        while (written < nLen) {
-            ssize_t n = ::write(fd, pData + written, nLen - written);
-            if (n > 0) {
-                written += n;
-            } else if (n < 0) {
-                if (errno == EINTR) {
-                    continue;
-                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // 内核缓冲区满，剩余部分入 buffer 走 EPOLLOUT
-                    break;
-                } else {
-                    std::cerr << "ConnectionBase::Send write failed! fd=" << fd
-                              << ", errno=" << errno << std::endl;
-                    return;
-                }
-            } else {
-                // n == 0 极少见，谨慎处理：不再尝试，剩余入 buffer
-                break;
-            }
-        }
-        if (written < nLen) {
-            // 没发完，剩余字节进 buffer + 开 EPOLLOUT
-            outputBuffer_.Append(pData + written, nLen - written);
-            loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
-        }
-        // 全部写完则不需改 epoll（此时通常已是 R 状态，EPOLLOUT 也无碍）
+
+    // ============================================================
+    //  Fast-path: 已在 loop 线程
+    //    → 直接调 sendInLoop 处理（写不完时自动入 outputBuffer_）
+    //    → 零分配（数据写完即返回）
+    //
+    //  Slow-path: 跨线程
+    //    → 必须深拷贝一份数据投递到 loop 线程
+    //    → 根据大小选择存储载体：
+    //      - 小包（< kBufferThreshold）→ std::string（SSO 友好或单次小 malloc）
+    //      - 大包（≥ kBufferThreshold）→ MessageBuffer（make_shared 合并分配）
+    // ============================================================
+    if (loop_->IsInLoopThread()) {
+        sendInLoop(fd, pData, (size_t)nLen);
         return;
     }
 
-    // ---- Slow-path ----
-    // 把数据 + ModifyEvent 打包成 task 投递到 loop 线程，与 HandleWrite 串行
-    std::string data(pData, nLen);
-    loop_->RunInLoop([this, fd, data = std::move(data)]() mutable {
-        // 已在 loop 线程执行：再做一次直发尝试（CanWriteDirectly 此时可能已就绪，
-        // 比如 Connector 连接刚完成）。否则走 buffer 路径。
-        bool tryDirect = outputBuffer_.Empty() && CanWriteDirectly();
-        size_t offset = 0;
-        if (tryDirect) {
-            while (offset < data.size()) {
-                ssize_t n = ::write(fd, data.data() + offset, data.size() - offset);
-                if (n > 0) {
-                    offset += n;
-                } else if (n < 0) {
-                    if (errno == EINTR) continue;
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                    std::cerr << "ConnectionBase::Send (slow-path direct) write failed! fd="
-                              << fd << ", errno=" << errno << std::endl;
-                    return;
-                } else {
-                    break;
-                }
-            }
-        }
-        if (offset < data.size()) {
-            outputBuffer_.Append(data.data() + offset, data.size() - offset);
-            loop_->ModifyEventKeepCallback(fd, EPOLL_EVENTS_RW);
-        }
-    });
+    if ((size_t)nLen >= ActorMessage::kBufferThreshold) {
+        // 大包：MessageBuffer 路径
+        auto buf = MakeBuffer(pData, (size_t)nLen);
+        loop_->RunInLoop([this, fd, buf = std::move(buf)]() mutable {
+            sendInLoop(fd, buf->Data(), buf->Size());
+        });
+    } else {
+        // 小包：std::string 路径
+        std::string data(pData, nLen);
+        loop_->RunInLoop([this, fd, data = std::move(data)]() mutable {
+            sendInLoop(fd, data.data(), data.size());
+        });
+    }
 }
 
 void ConnectionBase::HandleRead(int fd, uint32_t events)
@@ -139,10 +131,13 @@ void ConnectionBase::HandleRead(int fd, uint32_t events)
             return;
         }
         // 发送 NetworkRecv 消息给绑定的 Actor
+        // 使用 ActorMessage::Make 自动按大小选路径：
+        //   - 小包（< kBufferThreshold）走 std::string（SSO 友好）
+        //   - 大包走 sharedBuf（跨 Actor 转发零拷贝）
         auto* actorSys = loop_->GetActorSystem();
         if (actorSys) {
-            actorSys->SendByFd(fd, ActorMessage{MsgType::NetworkRecv, 0, fd,
-                                                 std::string(buffer, n)});
+            actorSys->SendByFd(fd, ActorMessage::Make(MsgType::NetworkRecv, 0, fd,
+                                                       buffer, n));
         }
     }
     // ET 模式下读完数据后不修改 epoll 事件，保持当前监听状态

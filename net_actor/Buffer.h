@@ -37,7 +37,9 @@ class Buffer
 {
 public:
     static const size_t kCheapPrepend = 8;     // 预留头部空间（业务可能要前置加协议头）
-    static const size_t kInitialSize = 64 * 1024;  // 初始 64KB
+    // 初始 128KB：在 1KB ~ 16KB 包 + 流水线窗口 64 ~ 256 场景下不易触发扩容
+    // 内存代价：1000 连接 ≈ 128MB，对游戏服/IM 等"数千连接"场景完全可接受
+    static const size_t kInitialSize = 128 * 1024;
 
     explicit Buffer(size_t initialSize = kInitialSize)
         : buffer_(kCheapPrepend + initialSize),
@@ -104,12 +106,16 @@ private:
 
     // 腾出 len 字节的 writable 空间
     // 优先压缩 prepend 区（把 readable 数据移到 kCheapPrepend 开头），
-    // 仍不够则扩容
+    // 仍不够则扩容。扩容采用"至少翻倍"策略，避免连续写入触发反复 realloc。
     void MakeSpace(size_t len)
     {
         if (WritableBytes() + PrependableBytes() < len + kCheapPrepend) {
             // 总空间不够 → 扩容
-            buffer_.resize(writerIndex_ + len);
+            // 翻倍 + 至少满足需求的两者取大，对应 vector 增长的"指数策略"，
+            // 避免连续 Append 触发多次 realloc + memcpy。
+            size_t needed = writerIndex_ + len;
+            size_t newCap = std::max(buffer_.size() * 2, needed);
+            buffer_.resize(newCap);
         } else {
             // 总空间够，但需要把 readable 区前移以释放 prepend 中的空闲
             assert(kCheapPrepend < readerIndex_);

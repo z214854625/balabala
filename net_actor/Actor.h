@@ -161,6 +161,8 @@ protected:
     // 响应协程Call请求（将response的sessionId/isResponse自动填充后发回给调用者）
     void RespondToCall(const ActorMessage& request, ActorMessage&& response);
     // 发送网络数据（通过EventLoop的Connection::Send）
+    // 业务层统一接口：只传 char* + int，框架内部按 fd 找 sub loop、走 Buffer，
+    // 大包路径的零拷贝优化由 ConnectionBase::Send 内部根据大小自动决定
     void SendToNetwork(int fd, const char* pData, int nLen);
 
     // ===== [P0] 定时器辅助方法 =====

@@ -57,10 +57,12 @@ static std::string encodeFrame(uint16_t cmd, const std::string& payload) {
     return frame;
 }
 
-static uint16_t parseCmd(const std::string& fullFrame) {
-    if (fullFrame.size() < 6) return 0;
+// 从一段已校验完整的帧数据中取出 cmd
+// 接受 (char*, size_t) 通用接口，业务侧/Gateway 都能直接用
+static uint16_t parseCmd(const char* data, size_t len) {
+    if (len < 6) return 0;
     uint16_t netCmd;
-    std::memcpy(&netCmd, fullFrame.data() + 4, 2);
+    std::memcpy(&netCmd, data + 4, 2);
     return ntohs(netCmd);
 }
 
@@ -78,8 +80,10 @@ public:
     ActorTask OnCoroutineMessage(ActorMessage msg) override {
         if (msg.type == MsgType::NetworkRecv) {
             framesRecv.fetch_add(1);
-            bytesRecv.fetch_add(msg.data.size());
-            SendToNetwork(msg.fd, msg.data.data(), (int)msg.data.size());
+            bytesRecv.fetch_add(msg.Size());
+            // 业务统一接口：SendToNetwork(fd, data, len)
+            // 框架内部根据大小自动选择 std::string 或 MessageBuffer
+            SendToNetwork(msg.fd, msg.Data(), (int)msg.Size());
             framesSent.fetch_add(1);
         }
         co_return;
@@ -110,7 +114,7 @@ public:
                 fdInputBuf_[msg.fd] = {};
                 break;
             case MsgType::NetworkRecv:
-                onRecv(msg.fd, msg.data);
+                onRecv(msg.fd, msg.Data(), msg.Size());   // 统一接口
                 break;
             case MsgType::Disconnected:
                 connCount.fetch_sub(1);
@@ -122,9 +126,9 @@ public:
     }
 
 private:
-    void onRecv(int fd, const std::string& data) {
+    void onRecv(int fd, const char* p, size_t len) {
         auto& buf = fdInputBuf_[fd];
-        buf.append(data);
+        buf.append(p, len);
         while (true) {
             if (buf.size() < 4) break;
             uint32_t netLen;
@@ -137,12 +141,14 @@ private:
             buf.erase(0, totalLen);
 
             if (fullFrame.size() < 6) { badFrames.fetch_add(1); continue; }
-            uint16_t cmd = parseCmd(fullFrame);
+            uint16_t cmd = parseCmd(fullFrame.data(), fullFrame.size());
             uint16_t module = cmdModule(cmd);
             auto it = moduleRoutes_.find(module);
             if (it == moduleRoutes_.end()) { badFrames.fetch_add(1); continue; }
 
-            ActorMessage forward(MsgType::NetworkRecv, GetActorId(), fd, std::move(fullFrame));
+            // 使用 ActorMessage::Make 工厂自动按大小选择 std::string / MessageBuffer
+            ActorMessage forward = ActorMessage::Make(
+                MsgType::NetworkRecv, GetActorId(), fd, std::move(fullFrame));
             GetSystem()->Send(it->second, std::move(forward));
             framesRouted.fetch_add(1);
         }

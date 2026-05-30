@@ -5,6 +5,8 @@
 @date: 2024.8.1
 @brief: 连接对象接口（Actor模型版本）
        移除了回调类型定义，改用Actor消息机制
+
+业务层统一使用 Send(char*, int)，框架内部根据大小自动优化
 */
 
 #include <cstdint>

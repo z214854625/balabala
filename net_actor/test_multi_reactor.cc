@@ -107,10 +107,11 @@ static std::string encodeFrame(uint16_t cmd, const std::string& payload) {
 }
 
 // 从一段已校验完整的帧数据中取出 cmd
-static uint16_t parseCmd(const std::string& fullFrame) {
-    if (fullFrame.size() < 6) return 0;
+// 接受 (char*, size_t) 通用接口，业务侧/Gateway 都能直接用
+static uint16_t parseCmd(const char* data, size_t len) {
+    if (len < 6) return 0;
     uint16_t netCmd;
-    std::memcpy(&netCmd, fullFrame.data() + 4, 2);
+    std::memcpy(&netCmd, data + 4, 2);
     return ntohs(netCmd);
 }
 
@@ -138,16 +139,19 @@ public:
 
     ActorTask OnCoroutineMessage(ActorMessage msg) override {
         if (msg.type == MsgType::NetworkRecv) {
-            uint16_t cmd = parseCmd(msg.data);
+            // 统一接口：通过 Data()/Size() 访问，自动适配小包/大包路径
+            const char* p = msg.Data();
+            size_t sz = msg.Size();
+            uint16_t cmd = parseCmd(p, sz);
             metrics.framesRecv.fetch_add(1);
-            metrics.bytesRecv.fetch_add(msg.data.size());
+            metrics.bytesRecv.fetch_add(sz);
 
-            // 简化业务：原样回传给客户端（典型场景：移动结果广播、技能结果等）
-            SendToNetwork(msg.fd, msg.data.data(), (int)msg.data.size());
+            // 业务统一用 SendToNetwork(fd, data, len)，
+            // 框架内部根据大小自动选择 std::string / MessageBuffer 路径
+            SendToNetwork(msg.fd, p, (int)sz);
             metrics.framesSent.fetch_add(1);
-            metrics.bytesSent.fetch_add(msg.data.size());
+            metrics.bytesSent.fetch_add(sz);
 
-            // 按 cmd 计数
             switch (cmd) {
                 case SCENE_MOVE:      metrics.cnt[0].fetch_add(1); break;
                 case SCENE_PICK_ITEM: metrics.cnt[1].fetch_add(1); break;
@@ -170,14 +174,16 @@ public:
 
     ActorTask OnCoroutineMessage(ActorMessage msg) override {
         if (msg.type == MsgType::NetworkRecv) {
-            uint16_t cmd = parseCmd(msg.data);
+            const char* p = msg.Data();
+            size_t sz = msg.Size();
+            uint16_t cmd = parseCmd(p, sz);
             metrics.framesRecv.fetch_add(1);
-            metrics.bytesRecv.fetch_add(msg.data.size());
+            metrics.bytesRecv.fetch_add(sz);
 
-            // 简化业务：原样回传（典型场景：聊天广播）
-            SendToNetwork(msg.fd, msg.data.data(), (int)msg.data.size());
+            // 业务统一用 SendToNetwork(fd, data, len)
+            SendToNetwork(msg.fd, p, (int)sz);
             metrics.framesSent.fetch_add(1);
-            metrics.bytesSent.fetch_add(msg.data.size());
+            metrics.bytesSent.fetch_add(sz);
 
             switch (cmd) {
                 case CHAT_WORLD:   metrics.cnt[0].fetch_add(1); break;
@@ -240,7 +246,8 @@ public:
                 break;
             }
             case MsgType::NetworkRecv: {
-                onRecv(msg.fd, msg.data);
+                // 统一接口：通过 Data()/Size() 访问，自动适配 std::string 或 sharedBuf
+                onRecv(msg.fd, msg.Data(), msg.Size());
                 break;
             }
             case MsgType::Disconnected: {
@@ -256,9 +263,9 @@ public:
     }
 
 private:
-    void onRecv(int fd, const std::string& data) {
+    void onRecv(int fd, const char* p, size_t len) {
         auto& buf = fdInputBuf_[fd];
-        buf.append(data);
+        buf.append(p, len);
 
         // 循环解出所有完整帧
         while (true) {
@@ -283,7 +290,7 @@ private:
             badFrames.fetch_add(1);
             return;
         }
-        uint16_t cmd = parseCmd(fullFrame);
+        uint16_t cmd = parseCmd(fullFrame.data(), fullFrame.size());
         uint16_t module = cmdModule(cmd);
 
         // 查路由表
@@ -297,12 +304,12 @@ private:
         uint32_t targetActorId = it->second;
 
         // 把完整帧装成 NetworkRecv 消息转发给目标 Actor
-        // 注意：保留 fd，让业务 Actor 知道回包给谁
-        ActorMessage forward(MsgType::NetworkRecv, GetActorId(), fd, std::move(fullFrame));
+        // 使用 ActorMessage::Make 工厂自动按大小选择 std::string / MessageBuffer 路径
+        ActorMessage forward = ActorMessage::Make(
+            MsgType::NetworkRecv, GetActorId(), fd, std::move(fullFrame));
         GetSystem()->Send(targetActorId, std::move(forward));
 
         framesRouted.fetch_add(1);
-        // 注意：unordered_map<uint16_t, atomic<int>> 用 [] 在新 key 时会值初始化为 0，OK
         routedByModule_[module].fetch_add(1);
     }
 };

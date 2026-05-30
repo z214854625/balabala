@@ -8,10 +8,16 @@
 [2026.5 改造] 写路径用 Buffer 替代 sendMQ_<string> + lastMsgCache_
   - 数据连续存储，减少 malloc/拷贝
   - HandleWrite 写出可一次大块 write，发不完时仅移指针
+
+[2026.5] 大包跨线程优化：Send(char*, int) 内部根据 nLen 自动选择：
+  - 小包 → std::string 路径（SSO 友好）
+  - 大包 → MessageBuffer 共享路径（避免 std::string 大包构造）
+  业务层无感知，统一只用 Send(char*, int)
 */
 
 #include "IConnection.h"
 #include "Buffer.h"
+#include "MessageBuffer.h"
 
 namespace bllsll {
 
@@ -23,7 +29,7 @@ public:
     ConnectionBase(EventLoop* loop);
     ~ConnectionBase();
 
-    //发送消息
+    //发送消息（统一接口）
     virtual void Send(const char* pData, int nLen);
     //读事件处理
     virtual void HandleRead(int fd, uint32_t events);
@@ -43,6 +49,13 @@ protected:
     // 发送缓冲区（仅 loop 线程访问；Send 通过 RunInLoop 投递到 loop 线程后再 Append）
     Buffer outputBuffer_;
     EventLoop* loop_;
+
+private:
+    // [2026.5] 私有辅助：在 loop 线程内尝试直发，发不完进 outputBuffer_。
+    // 三条 Send 路径（fast-path、slow-path 大包、slow-path 小包）共用此实现，
+    // 避免 write 循环 + 兜底逻辑重复。
+    // 必须在 loop 线程内调用。
+    void sendInLoop(int fd, const char* p, size_t len);
 };
 
 } //namespace bllsll
