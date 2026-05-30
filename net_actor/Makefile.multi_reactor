@@ -1,0 +1,54 @@
+# Makefile.multi_reactor - 主从 Reactor 测试
+# 用法: make -f Makefile.multi_reactor
+#
+# 验证主从 Reactor 模式下：
+#   - SubReactor 池正常启动
+#   - 新连接 Round-Robin 派发到不同 sub loop
+#   - fd → loop 映射正确
+#   - 多客户端并发收发
+
+.PHONY: all clean
+
+CXX      = g++
+CXXFLAGS = -Wall -g -m64 -fPIC -std=c++20 -fcoroutines -pthread -MMD -MP -include precompiled.h
+
+INCLUDE  = -I./
+
+LDFLAGS  = -L./
+LDLIBS   = -ldl -pthread
+
+BIN_PATH = .
+TARGET   = test_multi_reactor
+
+# 需要编译的源文件（排除 main.cc / TcpServer.cc / TcpClient.cc）
+TEST_SOURCES = test_multi_reactor.cc \
+                Actor.cc \
+                ActorSystem.cc \
+                Timer.cc \
+                EventLoop.cc \
+                Epollor.cc \
+                ConnectionBase.cc \
+                Connection.cc \
+                Acceptor.cc \
+                Connector.cc \
+                IOHelper.cc
+
+OBJECT_PATH    = ../Obj/MultiReactor
+OBJECTS        = $(patsubst %.cc,$(OBJECT_PATH)/%.o,$(TEST_SOURCES))
+DEPS           = $(OBJECTS:.o=.d)
+
+all: $(BIN_PATH)/$(TARGET)
+
+$(BIN_PATH)/$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
+$(OBJECT_PATH)/%.o: %.cc | $(OBJECT_PATH)
+	$(CXX) $(CXXFLAGS) -c $< $(INCLUDE) -o $@
+
+$(OBJECT_PATH):
+	mkdir -p $(OBJECT_PATH)
+
+-include $(DEPS)
+
+clean:
+	rm -rf $(OBJECT_PATH)/*.o $(OBJECT_PATH)/*.d $(BIN_PATH)/$(TARGET)
