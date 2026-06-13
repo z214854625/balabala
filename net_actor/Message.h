@@ -29,6 +29,17 @@ enum class MsgType : uint32_t {
     ActorDown,        // 被 Link 的 Actor 退出/注销（data 中含退出原因）
 };
 
+// Call / ClusterCall 错误码（仅在 isResponse=true 的响应消息上有意义）
+// 业务自定义错误从 UserError 起编号，避免与框架内置错误冲突
+enum class CallError : uint8_t {
+    Ok = 0,              // 正常响应
+    Timeout,             // 协程等待超时（默认 10s 或显式 timeoutMs）
+    TargetMissing,       // 目标 Actor 不存在（预留：当前未启用，等 ActorSystem::Send 校验后启用）
+    NodeUnreachable,     // 跨进程节点不可达（预留：等 ClusterProxy 错误回路完善后启用）
+    Cancelled,           // 主动取消（预留）
+    UserError = 100,     // 业务自定义错误起点
+};
+
 struct ActorMessage {
     MsgType type = MsgType::None;
     uint32_t sourceId = 0;     // 来源actor id (0表示系统/网络消息，仅本进程有效)
@@ -36,6 +47,7 @@ struct ActorMessage {
     std::string data;          // 消息数据（字符串格式，向后兼容；小包路径）
     uint32_t sessionId = 0;    // 协程会话ID（用于Call/Response配对）
     bool isResponse = false;   // 是否为Call的响应消息
+    CallError error = CallError::Ok;  // Call/ClusterCall 错误码（仅 isResponse=true 时有意义）
     bool priority = false;     // [P3] A.10 是否为高优先级消息
 
     // [P3] A.11 跨进程集群回程路由信息

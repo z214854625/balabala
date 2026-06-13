@@ -53,29 +53,41 @@ struct ActorTask
 };
 
 // ============================================================
-//  CallAwaiter: co_await Call(targetId, msg)
+//  CallAwaiter: co_await Call(targetId, msg, timeoutMs)
 //
 //  类似 Skynet 的 skynet.call()：
 //  1. 分配 sessionId
 //  2. 将当前协程句柄存入 waitMap_
 //  3. 发送消息给目标 Actor（带 sessionId）
-//  4. 挂起当前协程
-//  5. 目标 Actor 处理后调用 RespondToCall() 发回响应
-//  6. 响应到达邮箱 → OnMessage() 检测 isResponse → 恢复协程
-//  7. await_resume() 返回响应消息
+//  4. 若 timeoutMs > 0，注册一个超时定时器（到期后发回 isResponse + error=Timeout 的假响应）
+//  5. 挂起当前协程
+//  6. 目标 Actor 处理后调用 RespondToCall() 发回响应，或定时器先到 → 任一恢复协程
+//  7. await_resume() 返回响应消息（业务侧通过 resp.error 判断结果状态）
+//
+//  超时语义：
+//    - timeoutMs > 0  → 启用超时（默认 10s）
+//    - timeoutMs <= 0 → 永久等待（escape hatch）
+//    - 若真响应先到，await_resume 会取消定时器，避免之后的噪音消息
+//
+//  业务判错：
+//    if (resp.error != CallError::Ok) {
+//        // 处理失败：resp.error == CallError::Timeout / TargetMissing / ...
+//    }
 // ============================================================
 struct CallAwaiter
 {
     Actor* actor;
     uint32_t targetId;
     ActorMessage msg;
+    int timeoutMs = 10000;
     uint32_t sessionId = 0;
+    uint64_t timerId = 0;
 
     // 永远不会立即就绪（必须发送消息并等待）
     bool await_ready() const noexcept { return false; }
-    // 挂起时：注册等待、发送消息
+    // 挂起时：注册等待、发送消息、注册超时定时器
     void await_suspend(std::coroutine_handle<> h);
-    // 恢复时：取出响应消息
+    // 恢复时：取出响应消息，必要时取消未触发的超时定时器
     ActorMessage await_resume();
 };
 
@@ -102,11 +114,13 @@ struct ClusterCallAwaiter
     std::string targetNodeId;
     std::string targetActorName;
     ActorMessage msg;
+    int timeoutMs = 10000;
     uint32_t sessionId = 0;
+    uint64_t timerId = 0;
 
     // 永远不会立即就绪（必须发送到远端并等待）
     bool await_ready() const noexcept { return false; }
-    // 挂起时：注册等待、通过 SendToRemote 发送跨进程消息
+    // 挂起时：注册等待、通过 SendToRemote 发送跨进程消息、注册超时定时器
     void await_suspend(std::coroutine_handle<> h);
     // 恢复时：取出响应消息（与 CallAwaiter 相同的机制）
     ActorMessage await_resume();

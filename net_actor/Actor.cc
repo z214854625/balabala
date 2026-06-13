@@ -112,8 +112,8 @@ void Actor::OnMessage(ActorMessage& msg)
     if (msg.isResponse && msg.sessionId > 0) {
         // 这是一个 Response 消息 — 恢复等待的协程
         if (!ResumeWaiting(msg.sessionId, std::move(msg))) {
-            std::cout << "[Actor:" << actorId_
-                      << "] no coroutine waiting for session=" << msg.sessionId << std::endl;
+            // 常见原因：超时已先触发并恢复了协程，此后真响应才姗姗来迟 → 安全丢弃
+            std::cerr << "[Actor:" << actorId_ << "] late/orphan response dropped, session=" << msg.sessionId << std::endl;
         }
     } else {
         // 新消息 — 创建新协程处理
@@ -126,16 +126,17 @@ void Actor::OnMessage(ActorMessage& msg)
 //  Skynet 风格协程 API
 // ================================================================
 
-CallAwaiter Actor::Call(uint32_t targetId, ActorMessage&& msg)
+CallAwaiter Actor::Call(uint32_t targetId, ActorMessage&& msg, int timeoutMs)
 {
-    return CallAwaiter{this, targetId, std::move(msg)};
+    return CallAwaiter{this, targetId, std::move(msg), timeoutMs};
 }
 
 ClusterCallAwaiter Actor::ClusterCall(const std::string& targetNodeId,
                                        const std::string& targetActorName,
-                                       ActorMessage&& msg)
+                                       ActorMessage&& msg,
+                                       int timeoutMs)
 {
-    return ClusterCallAwaiter{this, targetNodeId, targetActorName, std::move(msg)};
+    return ClusterCallAwaiter{this, targetNodeId, targetActorName, std::move(msg), timeoutMs};
 }
 
 void Actor::Respond(const ActorMessage& request, ActorMessage&& response)
@@ -340,7 +341,20 @@ void CallAwaiter::await_suspend(std::coroutine_handle<> h)
     msg.sessionId = sessionId;
     actor->SendToActor(targetId, std::move(msg));
 
-    // 4. 返回后协程挂起，worker 线程释放
+    // 4. 注册超时定时器（timeoutMs <= 0 表示永久等待）
+    if (timeoutMs > 0) {
+        auto* sys = actor->GetSystem();
+        if (sys) {
+            ActorMessage timeoutMsg{MsgType::UserMessage, 0, -1, ""};
+            timeoutMsg.sessionId = sessionId;
+            timeoutMsg.isResponse = true;
+            timeoutMsg.error = CallError::Timeout;
+            timerId = sys->SetTimeout(actor->GetActorId(), timeoutMs,
+                                       std::move(timeoutMsg));
+        }
+    }
+
+    // 5. 返回后协程挂起，worker 线程释放
 }
 
 ActorMessage CallAwaiter::await_resume()
@@ -352,6 +366,13 @@ ActorMessage CallAwaiter::await_resume()
         result = std::move(it->second);
         actor->responseMap_.erase(it);
     }
+
+    // 若是正常响应（无错误），取消尚未触发的超时定时器，避免邮箱噪音
+    if (result.error == CallError::Ok && timerId != 0) {
+        auto* sys = actor->GetSystem();
+        if (sys) sys->CancelTimer(timerId);
+    }
+
     return result;
 }
 
@@ -371,7 +392,20 @@ void ClusterCallAwaiter::await_suspend(std::coroutine_handle<> h)
     msg.sessionId = sessionId;
     actor->SendToRemote(targetNodeId, targetActorName, std::move(msg));
 
-    // 4. 返回后协程挂起，worker 线程释放
+    // 4. 注册超时定时器（跨进程网络更易丢/慢，超时机制尤为重要）
+    if (timeoutMs > 0) {
+        auto* sys = actor->GetSystem();
+        if (sys) {
+            ActorMessage timeoutMsg{MsgType::UserMessage, 0, -1, ""};
+            timeoutMsg.sessionId = sessionId;
+            timeoutMsg.isResponse = true;
+            timeoutMsg.error = CallError::Timeout;
+            timerId = sys->SetTimeout(actor->GetActorId(), timeoutMs,
+                                       std::move(timeoutMsg));
+        }
+    }
+
+    // 5. 返回后协程挂起，worker 线程释放
 }
 
 ActorMessage ClusterCallAwaiter::await_resume()
@@ -383,6 +417,13 @@ ActorMessage ClusterCallAwaiter::await_resume()
         result = std::move(it->second);
         actor->responseMap_.erase(it);
     }
+
+    // 若是正常响应（无错误），取消尚未触发的超时定时器
+    if (result.error == CallError::Ok && timerId != 0) {
+        auto* sys = actor->GetSystem();
+        if (sys) sys->CancelTimer(timerId);
+    }
+
     return result;
 }
 

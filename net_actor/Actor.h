@@ -131,15 +131,22 @@ public:
     // ===== Skynet 风格协程 API =====
 
     // 类似 skynet.call()：发送消息并等待响应（本地RPC）
-    // 用法: auto resp = co_await Call(targetId, msg);
-    CallAwaiter Call(uint32_t targetId, ActorMessage&& msg);
+    // 用法: auto resp = co_await Call(targetId, msg);             // 默认 10s 超时
+    //       auto resp = co_await Call(targetId, msg, 3000);       // 3s 超时
+    //       auto resp = co_await Call(targetId, msg, 0);          // 永久等待(escape hatch)
+    // 超时时 resp.isResponse=true, resp.error=CallError::Timeout
+    // 业务侧应先判 resp.error == CallError::Ok 再用 resp.data
+    static constexpr int kDefaultCallTimeoutMs = 10000;
+    CallAwaiter Call(uint32_t targetId, ActorMessage&& msg,
+                     int timeoutMs = kDefaultCallTimeoutMs);
 
     // 类似 skynet cluster.call()：跨进程发送消息并等待响应（跨进程RPC）
     // 注意：调用方 Actor 必须已通过 RegisterName() 注册名字！
-    // 用法: auto resp = co_await ClusterCall("nodeB", "db_service", msg);
+    // 用法: auto resp = co_await ClusterCall("nodeB", "db_service", msg);  // 默认 10s 超时
     ClusterCallAwaiter ClusterCall(const std::string& targetNodeId,
                                    const std::string& targetActorName,
-                                   ActorMessage&& msg);
+                                   ActorMessage&& msg,
+                                   int timeoutMs = kDefaultCallTimeoutMs);
 
     // 类似 skynet.ret()：响应一个 Call 请求（本地）
     // 用法: Respond(originalMsg, responseMsg);

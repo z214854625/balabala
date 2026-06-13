@@ -563,9 +563,9 @@ class DataQueryActor : public Actor
 public:
     std::atomic<int> queryCount{0};
 
-    void OnMessage(ActorMessage& msg) override
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
     {
-        if (msg.type != MsgType::UserMessage) return;
+        if (msg.type != MsgType::UserMessage) co_return;
         queryCount.fetch_add(1);
 
         // 模拟数据库查询
@@ -573,6 +573,7 @@ public:
         std::cout << "[DataQueryActor] query: " << msg.data
                   << " → " << result << std::endl;
         RespondToCall(msg, ActorMessage{MsgType::UserMessage, 0, -1, result});
+        co_return;
     }
 };
 
@@ -743,6 +744,241 @@ bool Test6_AsyncServiceCall()
 }
 
 // ============================================================
+//  Test7-9 用：SilentActor — 收到消息但故意不 Respond（模拟超时场景）
+// ============================================================
+class SilentActor : public Actor
+{
+public:
+    std::atomic<int> recvCount{0};
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
+    {
+        recvCount.fetch_add(1);
+        // 故意不响应，让调用方协程超时
+        co_return;
+    }
+};
+
+// ============================================================
+//  Test7-9 用：DelayedActor — 收到消息后延迟 delayMs 再 Respond
+//  通过 SetTimeout 在指定时间后回复，验证慢响应/真响应抢跑场景
+// ============================================================
+class DelayedActor : public Actor
+{
+public:
+    int delayMs = 0;
+    std::atomic<int> respondCount{0};
+
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
+    {
+        if (msg.isResponse) co_return;  // 忽略定时器回拨自己的消息
+        if (delayMs <= 0) {
+            RespondToCall(msg, ActorMessage{MsgType::UserMessage, 0, -1, "ok:" + msg.data});
+            respondCount.fetch_add(1);
+        } else {
+            co_await Sleep(delayMs);
+            RespondToCall(msg, ActorMessage{MsgType::UserMessage, 0, -1, "ok:" + msg.data});
+            respondCount.fetch_add(1);
+        }
+        co_return;
+    }
+};
+
+// ============================================================
+//  Test7-9 用：TimeoutCallerActor — 发起带超时的 Call，记录结果
+// ============================================================
+class TimeoutCallerActor : public Actor
+{
+public:
+    uint32_t targetId = 0;
+    int callTimeoutMs = 500;
+    std::atomic<bool> done{false};
+    std::atomic<int> gotError{0};   // 保存 resp.error 的整数值，便于跨线程读取
+    std::string gotData;
+    int64_t elapsedMs = 0;
+
+    ActorTask OnCoroutineMessage(ActorMessage msg) override
+    {
+        if (msg.isResponse) co_return;
+        if (msg.data != "go") co_return;
+
+        auto start = std::chrono::steady_clock::now();
+        auto resp = co_await Call(targetId,
+            ActorMessage{MsgType::UserMessage, 0, -1, "ping"},
+            callTimeoutMs);
+        auto end = std::chrono::steady_clock::now();
+        elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        gotError.store(static_cast<int>(resp.error));
+        gotData = resp.CopyToString();
+        done.store(true);
+        co_return;
+    }
+};
+
+// ============================================================
+//  Test7: 超时唤醒 — Call 一个不响应的 Actor，500ms 后协程被超时唤醒
+// ============================================================
+bool Test7_CallTimeout()
+{
+    std::cout << "\n========== Test7: Call Timeout ==========" << std::endl;
+    std::cout << "  Caller co_await Call(Silent, msg, 500ms) — 期望 500ms 后超时唤醒" << std::endl;
+
+    ActorSystem sys;
+    sys.Start(4, nullptr);
+
+    auto silentPtr = std::make_unique<SilentActor>();
+    SilentActor* silent = silentPtr.get();
+    uint32_t silentId = sys.RegisterActor(std::move(silentPtr));
+
+    auto callerPtr = std::make_unique<TimeoutCallerActor>();
+    TimeoutCallerActor* caller = callerPtr.get();
+    caller->targetId = silentId;
+    caller->callTimeoutMs = 500;
+    uint32_t callerId = sys.RegisterActor(std::move(callerPtr));
+
+    sys.Send(callerId, ActorMessage{MsgType::UserMessage, 0, -1, "go"});
+
+    bool ok = true;
+    if (!WaitFor(caller->done, 3000)) {
+        std::cout << "[FAIL] 协程未被超时唤醒（3s 内 done 未置位）" << std::endl;
+        ok = false;
+    } else {
+        if (caller->gotError.load() != (int)CallError::Timeout) {
+            std::cout << "[FAIL] resp.error 应为 CallError::Timeout, 实际 = "
+                      << caller->gotError.load() << std::endl;
+            ok = false;
+        }
+        // 允许定时器误差 ±100ms
+        if (caller->elapsedMs < 400 || caller->elapsedMs > 1500) {
+            std::cout << "[FAIL] 超时耗时异常: " << caller->elapsedMs
+                      << "ms (期望 ~500ms)" << std::endl;
+            ok = false;
+        } else {
+            std::cout << "[PASS] 超时耗时: " << caller->elapsedMs << "ms" << std::endl;
+        }
+        if (silent->recvCount.load() != 1) {
+            std::cout << "[FAIL] SilentActor 应该收到 1 条请求" << std::endl;
+            ok = false;
+        }
+    }
+
+    sys.Stop();
+    return ok;
+}
+
+// ============================================================
+//  Test8: 正常 Call 不受超时干扰 — 响应快于超时阈值，error 应为 Ok
+// ============================================================
+bool Test8_CallNoTimeoutWhenRespondedFast()
+{
+    std::cout << "\n========== Test8: No Timeout When Responded Fast ==========" << std::endl;
+    std::cout << "  Delayed(50ms) 远早于 timeout(1000ms) — 应该正常返回" << std::endl;
+
+    ActorSystem sys;
+    sys.Start(4, nullptr);
+
+    auto delayedPtr = std::make_unique<DelayedActor>();
+    DelayedActor* delayed = delayedPtr.get();
+    delayed->delayMs = 50;
+    uint32_t delayedId = sys.RegisterActor(std::move(delayedPtr));
+
+    auto callerPtr = std::make_unique<TimeoutCallerActor>();
+    TimeoutCallerActor* caller = callerPtr.get();
+    caller->targetId = delayedId;
+    caller->callTimeoutMs = 1000;
+    uint32_t callerId = sys.RegisterActor(std::move(callerPtr));
+
+    sys.Send(callerId, ActorMessage{MsgType::UserMessage, 0, -1, "go"});
+
+    bool ok = true;
+    if (!WaitFor(caller->done, 3000)) {
+        std::cout << "[FAIL] 未在 3s 内完成" << std::endl;
+        ok = false;
+    } else {
+        if (caller->gotError.load() != (int)CallError::Ok) {
+            std::cout << "[FAIL] resp.error 应为 CallError::Ok (响应已及时到达), 实际 = "
+                      << caller->gotError.load() << std::endl;
+            ok = false;
+        }
+        if (caller->gotData != "ok:ping") {
+            std::cout << "[FAIL] 响应数据错误: '" << caller->gotData << "'" << std::endl;
+            ok = false;
+        } else {
+            std::cout << "[PASS] 拿到响应: '" << caller->gotData
+                      << "', 耗时 " << caller->elapsedMs << "ms" << std::endl;
+        }
+        // 等额外 1.5s，确认没有 Timeout 假响应在后面把别的协程搅乱
+        // （此时定时器应被 await_resume 已取消）
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        // DelayedActor 只应处理 1 条业务请求
+        if (delayed->respondCount.load() != 1) {
+            std::cout << "[FAIL] DelayedActor 处理次数异常: "
+                      << delayed->respondCount.load() << std::endl;
+            ok = false;
+        }
+    }
+
+    sys.Stop();
+    return ok;
+}
+
+// ============================================================
+//  Test9: 超时后慢响应才到达 — 验证不会二次唤醒、不会崩溃
+// ============================================================
+bool Test9_LateResponseAfterTimeout()
+{
+    std::cout << "\n========== Test9: Late Response After Timeout ==========" << std::endl;
+    std::cout << "  Delayed(800ms) 慢于 timeout(200ms) — 先超时，慢响应到达时应被安全丢弃" << std::endl;
+
+    ActorSystem sys;
+    sys.Start(4, nullptr);
+
+    auto delayedPtr = std::make_unique<DelayedActor>();
+    DelayedActor* delayed = delayedPtr.get();
+    delayed->delayMs = 800;
+    uint32_t delayedId = sys.RegisterActor(std::move(delayedPtr));
+
+    auto callerPtr = std::make_unique<TimeoutCallerActor>();
+    TimeoutCallerActor* caller = callerPtr.get();
+    caller->targetId = delayedId;
+    caller->callTimeoutMs = 200;
+    uint32_t callerId = sys.RegisterActor(std::move(callerPtr));
+
+    sys.Send(callerId, ActorMessage{MsgType::UserMessage, 0, -1, "go"});
+
+    bool ok = true;
+    if (!WaitFor(caller->done, 2000)) {
+        std::cout << "[FAIL] 协程未被超时唤醒" << std::endl;
+        ok = false;
+    } else {
+        if (caller->gotError.load() != (int)CallError::Timeout) {
+            std::cout << "[FAIL] 应该是超时唤醒（error=Timeout）, 实际 = "
+                      << caller->gotError.load() << std::endl;
+            ok = false;
+        } else {
+            std::cout << "[PASS] 协程在 " << caller->elapsedMs
+                      << "ms 时被超时唤醒" << std::endl;
+        }
+    }
+
+    // 等待 1.5s 让慢响应也到达（800ms 后），观察是否崩溃 / 二次回调
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    // done 应该只被置位一次（协程只恢复了一次）— 这里用 caller 还活着没崩来证明
+    if (delayed->respondCount.load() != 1) {
+        std::cout << "[FAIL] DelayedActor 应该响应 1 次, 实际 "
+                  << delayed->respondCount.load() << std::endl;
+        ok = false;
+    } else {
+        std::cout << "[PASS] 慢响应已安全丢弃，进程未崩溃，DelayedActor 正常响应了 1 次"
+                  << std::endl;
+    }
+
+    sys.Stop();
+    return ok;
+}
+
+// ============================================================
 //  main
 // ============================================================
 int main()
@@ -767,6 +1003,9 @@ int main()
     if (Test4_ChainCall())             ++passed; else ++failed;
     if (Test5_Integration())           ++passed; else ++failed;
     if (Test6_AsyncServiceCall())      ++passed; else ++failed;
+    if (Test7_CallTimeout())                  ++passed; else ++failed;
+    if (Test8_CallNoTimeoutWhenRespondedFast()) ++passed; else ++failed;
+    if (Test9_LateResponseAfterTimeout())     ++passed; else ++failed;
 
     std::cout << "\n==================================================" << std::endl;
     std::cout << "  Result: " << passed << " passed, " << failed << " failed" << std::endl;
