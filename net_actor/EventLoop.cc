@@ -19,12 +19,10 @@ EventLoop::~EventLoop()
         ::close(wakeupFd_);
         wakeupFd_ = -1;
     }
-    // 清理mapConn_中的Connection对象（由EventLoop通过new创建并管理）
-    // Acceptor/Connector不在mapConn_中，由TcpServer/TcpClient管理
-    for (auto& [fd, pConn] : mapConn_) {
-        delete pConn;
-    }
+    // mapConn_ 使用 shared_ptr 管理，clear 时自动析构
+    // mapConnRaw_ 中的 Acceptor/Connector 由外部管理，这里只清空映射
     mapConn_.clear();
+    mapConnRaw_.clear();
 }
 
 void EventLoop::Create()
@@ -256,21 +254,35 @@ int64_t EventLoop::GetMilliSeconds() {
     return now_ms.time_since_epoch().count();
 }
 
-void EventLoop::AddConnection(IConnection* pConn)
+void EventLoop::AddConnection(std::shared_ptr<IConnection> pConn)
 {
     bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
     mapConn_.insert({pConn->GetFd(), pConn});
     std::cout << "AddConnection fd=" << pConn->GetFd() << std::endl;
 }
 
-IConnection* EventLoop::GetConnection(int fd)
+void EventLoop::AddConnectionRaw(IConnection* pConn)
 {
     bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
+    mapConnRaw_.insert({pConn->GetFd(), pConn});
+    std::cout << "AddConnectionRaw fd=" << pConn->GetFd() << std::endl;
+}
+
+std::shared_ptr<IConnection> EventLoop::GetConnection(int fd)
+{
+    bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
+    // 先查 shared_ptr 管理的 Connection
     auto it = mapConn_.find(fd);
-    if (it == mapConn_.end()) {
-        return nullptr;
+    if (it != mapConn_.end()) {
+        return it->second;
     }
-    return it->second;
+    // 再查裸指针管理的 Acceptor/Connector（返回空 shared_ptr，调用者需要小心）
+    auto itRaw = mapConnRaw_.find(fd);
+    if (itRaw != mapConnRaw_.end()) {
+        // 返回一个不管理生命周期的 shared_ptr（空 deleter）
+        return std::shared_ptr<IConnection>(itRaw->second, [](IConnection*){});
+    }
+    return nullptr;
 }
 
 void EventLoop::RemoveConnection(int fd)
@@ -291,19 +303,16 @@ void EventLoop::RemoveConnection(int fd)
             bllsll::LockGuard<bllsll::SpinLock> lock(cbSpinLock_);
             callbacks_.erase(fd);
         }
-        // 再删 Connection 对象
-        IConnection* pConn = nullptr;
+        // 移除 Connection 对象（shared_ptr 自动管理生命周期）
         {
             bllsll::LockGuard<bllsll::SpinLock> lock(connSpinLock_);
             auto it = mapConn_.find(fd);
             if (it != mapConn_.end()) {
-                pConn = it->second;
                 mapConn_.erase(it);
+                std::cout << "RemoveConnection fd=" << fd << std::endl;
             }
-        }
-        if (pConn) {
-            delete pConn;
-            std::cout << "RemoveConnection fd=" << fd << std::endl;
+            // 也清理裸指针映射（但不 delete，由外部管理）
+            mapConnRaw_.erase(fd);
         }
     });
 }

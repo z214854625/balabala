@@ -226,7 +226,8 @@ void Actor::SendToNetwork(int fd, const char* pData, int nLen)
         // 兼容：单 Reactor 时 GetEventLoopByFd 回退返回主 loop_
         auto* loop = system_->GetEventLoopByFd(fd);
         if (loop) {
-            auto* pConn = loop->GetConnection(fd);
+            // [P0-4 修复] GetConnection 返回 shared_ptr，持有期间 Connection 不会被析构
+            auto pConn = loop->GetConnection(fd);
             if (pConn) {
                 pConn->Send(pData, nLen);
             } else {

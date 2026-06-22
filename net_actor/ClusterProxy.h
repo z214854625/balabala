@@ -334,7 +334,7 @@ private:
     Acceptor* acceptor_ = nullptr;
 
     // fd ↔ nodeId 双向映射（SpinLock 保护）
-    bllsll::SpinLock connLock_;
+    mutable bllsll::SpinLock connLock_;
     std::unordered_map<std::string, int> nodeToFd_;
     std::unordered_map<int, std::string> fdToNode_;
 
@@ -343,7 +343,7 @@ private:
     std::vector<ClusterNode> knownNodes_;
 
     // 待握手连接（ConnectToNode 时预存 fd → nodeId）
-    bllsll::SpinLock pendingLock_;
+    mutable bllsll::SpinLock pendingLock_;
     std::unordered_map<int, std::string> pendingNodeId_;
 };
 

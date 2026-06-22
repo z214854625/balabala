@@ -47,6 +47,11 @@ void Connector::HandleWrite(int fd, uint32_t events)
         socklen_t errLen = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errLen) < 0 || err != 0) {
             std::cerr << "Connector connect failed! fd=" << fd << ", err=" << err << std::endl;
+            // [P1-1 修复] 连接失败时通知 ownerActor
+            auto* actorSys = loop_->GetActorSystem();
+            if (actorSys) {
+                actorSys->Send(ownerActorId_, ActorMessage{MsgType::Disconnected, 0, fd, "connect_failed"});
+            }
             loop_->RemoveEvent(fd);
             close(socket_);
             socket_ = -1;
@@ -121,8 +126,8 @@ void Connector::_Connect(int port, const std::string& strIp)
             pConn->HandleWrite(fd, event);
         }
     });
-    //添加到管理列表中
-    loop_->AddConnection(this);
+    //添加到管理列表中（裸指针，由 TcpClient 管理生命周期）
+    loop_->AddConnectionRaw(this);
 
     if (!connecting_) {
         // 连接已立即成功，绑定fd并通知Actor

@@ -50,10 +50,12 @@ public:
     ActorSystem* GetActorSystem() { return actorSystem_; }
     //获取系统毫秒
     int64_t GetMilliSeconds();
-    //加入连接对象列表
-    void AddConnection(bllsll::IConnection* pConn);
-    //获取连接对象列表
-    bllsll::IConnection* GetConnection(int fd);
+    //加入连接对象列表（shared_ptr 版本，用于 Connection）
+    void AddConnection(std::shared_ptr<bllsll::IConnection> pConn);
+    //加入连接对象列表（裸指针版本，用于 Acceptor/Connector，不管理生命周期）
+    void AddConnectionRaw(bllsll::IConnection* pConn);
+    //获取连接对象（返回 shared_ptr，调用者持有期间不会被析构）
+    std::shared_ptr<bllsll::IConnection> GetConnection(int fd);
     //删除连接对象（线程安全：自动延迟到 loop 线程执行，避免 HandleRead 自删的 UAF）
     void RemoveConnection(int fd);
 
@@ -77,13 +79,14 @@ private:
     std::thread loopThread_;                        //epoll loop线程
     std::thread::id loopThreadId_{};                 //loop线程id，用于 IsInLoopThread
     int wakeupFd_ = -1;                              //eventfd，用于跨线程唤醒/退出
-    bllsll::SpinLock pendingLock_;                   //保护 pendingTasks_
+    mutable bllsll::SpinLock pendingLock_;                   //保护 pendingTasks_
     std::vector<PendingTask> pendingTasks_;          //跨线程投递的任务
 
-    bllsll::SpinLock cbSpinLock_;                    //保护callbacks_
+    mutable bllsll::SpinLock cbSpinLock_;                    //保护callbacks_
     std::unordered_map<int, Callback> callbacks_;    //fd→回调映射
-    bllsll::SpinLock connSpinLock_;                  //保护mapConn_
-    std::unordered_map<int, bllsll::IConnection*> mapConn_; //连接对象
+    mutable bllsll::SpinLock connSpinLock_;                  //保护mapConn_
+    std::unordered_map<int, std::shared_ptr<bllsll::IConnection>> mapConn_; //连接对象（shared_ptr 管理）
+    std::unordered_map<int, bllsll::IConnection*> mapConnRaw_;  //裸指针连接（Acceptor/Connector，不管理生命周期）
     ActorSystem* actorSystem_ = nullptr;             //Actor系统（不拥有，由外部管理）
 };
 

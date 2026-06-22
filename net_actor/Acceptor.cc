@@ -1,6 +1,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <memory>
 #include "Acceptor.h"
 #include "EventLoop.h"
 #include "EventLoopThreadPool.h"
@@ -57,7 +58,8 @@ void Acceptor::HandleAccept(int listenFd, uint32_t events)
             if (sub) targetLoop = sub;
         }
 
-        IConnection* pNewConn = new Connection(clientFd, targetLoop);
+        // [P0-4 修复] 使用 shared_ptr 管理 Connection
+        auto pNewConn = std::make_shared<Connection>(clientFd, targetLoop);
         if (pNewConn == nullptr) {
             std::cout << "HandleAccept pNewConn null. clientFd=" << clientFd << std::endl;
             continue;
@@ -115,7 +117,7 @@ void Acceptor::_Listen(int port)
         close(socket_);
         throw std::runtime_error("Acceptor listen failed! errno=" + to_string(errno));
     }
-    loop_->AddConnection(this); //添加到连接列表
+    loop_->AddConnectionRaw(this); //添加到连接列表（裸指针，由 TcpServer 管理生命周期）
     loop_->AddEvent(socket_, EPOLL_EVENTS_R, [this](int fd, uint32_t events) {
         auto pAccept = loop_->GetConnection(fd);
         if (pAccept == nullptr) {

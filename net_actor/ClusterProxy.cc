@@ -29,7 +29,8 @@ ActorTask ClusterProxy::OnCoroutineMessage(ActorMessage msg)
     pkt.targetActorName = remote_.remoteName;
     pkt.sessionId = msg.sessionId;
     pkt.isResponse = msg.isResponse;
-    pkt.data = msg.data;
+    // [P0-5 修复] 使用 CopyToString() 统一访问，支持大包（sharedBuf）和小包（data）
+    pkt.data = msg.CopyToString();
 
     if (!transport_->SendPacket(pkt)) {
         std::cerr << "[ClusterProxy] failed to send to " << remote_.ToString() << std::endl;
@@ -223,8 +224,9 @@ ActorTask ClusterGatewayActor::OnCoroutineMessage(ActorMessage msg)
 
     case MsgType::NetworkRecv: {
         // 追加到接收缓冲区
+        // [P0-5 修复] 使用 Data()/Size() 统一访问，支持大包（sharedBuf）和小包（data）
         auto& buf = recvBuffers_[msg.fd];
-        buf.append(msg.data);
+        buf.append(msg.Data(), msg.Size());
 
         // 循环尝试解码完整数据包
         while (true) {
@@ -381,7 +383,8 @@ bool TcpClusterTransport::SendPacket(const ClusterPacket& packet)
     std::string encoded = ClusterPacketCodec::Encode(packet);
 
     // 通过 EventLoop 的 Connection 发送
-    auto* conn = loop_->GetConnection(fd);
+    // [P0-4 修复] GetConnection 返回 shared_ptr
+    auto conn = loop_->GetConnection(fd);
     if (!conn) {
         std::cerr << "[TcpClusterTransport] connection lost for node="
                   << packet.targetNodeId << ", fd=" << fd << std::endl;
@@ -509,7 +512,8 @@ void TcpClusterTransport::sendHandshake(int fd)
 
     // 序列化并发送
     std::string encoded = ClusterPacketCodec::Encode(handshake);
-    auto* conn = loop_->GetConnection(fd);
+    // [P0-4 修复] GetConnection 返回 shared_ptr
+    auto conn = loop_->GetConnection(fd);
     if (conn) {
         conn->Send(encoded.data(), static_cast<int>(encoded.size()));
         std::cout << "[TcpClusterTransport] handshake sent, fd=" << fd

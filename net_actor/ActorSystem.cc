@@ -45,20 +45,30 @@ void ActorSystem::Stop()
     workers_.clear();
 
     // Phase 3: 排空剩余邮箱（在主线程处理，最多处理 maxDrainRounds 轮避免无限循环）
+    // 注意：必须在锁外调用 ProcessOne，避免业务代码回调 Send 时死锁
     const int maxDrainRounds = 3;
     for (int round = 0; round < maxDrainRounds; ++round) {
         bool anyProcessed = false;
-        bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
-        for (auto& [id, actor] : actors_) {
+        // 锁内拷贝 actor 列表
+        std::vector<Actor*> actorList;
+        {
+            bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
+            actorList.reserve(actors_.size());
+            for (auto& [id, actor] : actors_) {
+                actorList.push_back(actor.get());
+            }
+        }
+        // 锁外处理消息
+        for (Actor* actor : actorList) {
             int drained = 0;
             while (!actor->IsMailboxEmpty() && drained < 64) {
                 try {
                     actor->ProcessOne();
                 } catch (const std::exception& e) {
-                    std::cerr << "[ActorSystem::Stop] drain exception in actor " << id
+                    std::cerr << "[ActorSystem::Stop] drain exception in actor " << actor->GetActorId()
                               << ": " << e.what() << std::endl;
                 } catch (...) {
-                    std::cerr << "[ActorSystem::Stop] drain unknown exception in actor " << id << std::endl;
+                    std::cerr << "[ActorSystem::Stop] drain unknown exception in actor " << actor->GetActorId() << std::endl;
                 }
                 ++drained;
                 anyProcessed = true;
@@ -67,7 +77,7 @@ void ActorSystem::Stop()
         if (!anyProcessed) break;
     }
 
-    // Phase 4: 记录未处理消息数量并清理
+    // Phase 4: 记录未处理消息数量并清理协程帧
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
         for (auto& [id, actor] : actors_) {
@@ -75,6 +85,8 @@ void ActorSystem::Stop()
                 std::cerr << "[ActorSystem::Stop] actor " << id
                           << " still has unprocessed messages (mailbox not empty)" << std::endl;
             }
+            // [P1-2] 清理挂起的协程帧，避免泄漏
+            actor->DestroyAllCoroutines();
         }
     }
 
@@ -93,6 +105,12 @@ void ActorSystem::Stop()
 }
 
 uint32_t ActorSystem::RegisterActor(std::unique_ptr<Actor> actor)
+{
+    // 转为 shared_ptr 调用
+    return RegisterActor(std::shared_ptr<Actor>(std::move(actor)));
+}
+
+uint32_t ActorSystem::RegisterActor(std::shared_ptr<Actor> actor)
 {
     uint32_t id = nextActorId_.fetch_add(1);
     actor->SetActorId(id);
@@ -136,7 +154,8 @@ void ActorSystem::UnregisterActor(uint32_t actorId)
 
 void ActorSystem::Send(uint32_t actorId, ActorMessage&& msg)
 {
-    Actor* actor = nullptr;
+    // [P0-1 修复] 持有 shared_ptr 副本，保证锁外访问时 Actor 不会被析构
+    std::shared_ptr<Actor> actor;
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
         auto it = actors_.find(actorId);
@@ -144,7 +163,7 @@ void ActorSystem::Send(uint32_t actorId, ActorMessage&& msg)
             std::cout << "ActorSystem::Send actor not found! id=" << actorId << std::endl;
             return;
         }
-        actor = it->second.get();
+        actor = it->second;  // 拷贝 shared_ptr，增加引用计数
     }
 
     actor->PushMessage(std::move(msg));
@@ -303,7 +322,8 @@ bool ActorSystem::SendByName(const std::string& name, ActorMessage&& msg)
 
 size_t ActorSystem::GetActorCount() const
 {
-    bllsll::LockGuard<bllsll::SpinLock> lock(const_cast<bllsll::SpinLock&>(actorsLock_));
+    // [P1-6 修复] actorsLock_ 已声明为 mutable，无需 const_cast
+    bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
     return actors_.size();
 }
 
@@ -481,14 +501,15 @@ void ActorSystem::workerLoop()
             continue;
         }
         uint32_t actorId = *optId;
-        Actor* actor = nullptr;
+        // [P0-1 修复] 持有 shared_ptr 副本，保证锁外访问时 Actor 不会被析构
+        std::shared_ptr<Actor> actor;
         {
             bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
             auto it = actors_.find(actorId);
             if (it == actors_.end()) {
                 continue;
             }
-            actor = it->second.get();
+            actor = it->second;  // 拷贝 shared_ptr，增加引用计数
         }
 
         // [P0] 异常保护：批量处理消息时捕获异常

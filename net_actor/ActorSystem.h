@@ -56,8 +56,10 @@ public:
     // 停止Actor系统（优雅关停：定时器→Worker→排空邮箱→清理协程）
     void Stop();
 
-    // 注册Actor，返回actorId
+    // 注册Actor，返回actorId（接受 unique_ptr，内部转为 shared_ptr）
     uint32_t RegisterActor(std::unique_ptr<Actor> actor);
+    // 注册Actor（直接接受 shared_ptr）
+    uint32_t RegisterActor(std::shared_ptr<Actor> actor);
     // 注销Actor（会触发 Link 通知，向所有 watcher 发送 ActorDown 消息）
     void UnregisterActor(uint32_t actorId);
     // 发消息给Actor
@@ -132,12 +134,12 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> nextActorId_{1};
 
-    // Actor存储
-    bllsll::SpinLock actorsLock_;
-    std::unordered_map<uint32_t, std::unique_ptr<Actor>> actors_;
+    // Actor存储 - 使用 shared_ptr 管理生命周期，避免跨锁使用裸指针导致 UAF
+    mutable bllsll::SpinLock actorsLock_;
+    std::unordered_map<uint32_t, std::shared_ptr<Actor>> actors_;
 
     // fd -> actorId映射
-    bllsll::SpinLock fdMapLock_;
+    mutable bllsll::SpinLock fdMapLock_;
     std::unordered_map<int, uint32_t> fdToActor_;
     // [2026.5 多 Reactor] fd -> EventLoop 映射（用于 SubReactor 模式下按 fd 找 loop）
     std::unordered_map<int, EventLoop*> fdToLoop_;
@@ -156,16 +158,16 @@ private:
     TimerManager timerManager_;
 
     // [P1] Actor名字 → actorId 映射
-    bllsll::SpinLock nameLock_;
+    mutable bllsll::SpinLock nameLock_;
     std::unordered_map<std::string, uint32_t> nameToActor_;
     std::unordered_map<uint32_t, std::string> actorToName_;  // 反向映射，用于注销时清理
 
     // [P2] Link 注册表: targetId → set<watcherId>
-    bllsll::SpinLock linkLock_;
+    mutable bllsll::SpinLock linkLock_;
     std::unordered_map<uint32_t, std::set<uint32_t>> linkMap_;
 
     // [P3] A.11 集群传输层列表
-    bllsll::SpinLock transportLock_;
+    mutable bllsll::SpinLock transportLock_;
     std::vector<IClusterTransport*> transports_;
 };
 
