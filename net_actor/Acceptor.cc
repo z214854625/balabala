@@ -21,8 +21,12 @@ Acceptor::Acceptor(int port, EventLoop* loop, uint32_t listenerActorId)
 
 Acceptor::~Acceptor()
 {
-    if (socket_ != -1) {
+    // [P2-7 修复] 析构前移除 epoll 事件和连接映射，避免 callbacks_ 残留悬空 this
+    if (socket_ != -1 && loop_) {
+        loop_->RemoveConnection(socket_);
+        loop_->RemoveEvent(socket_);
         close(socket_);
+        socket_ = -1;
     }
 }
 
@@ -77,7 +81,9 @@ void Acceptor::HandleAccept(int listenFd, uint32_t events)
 
         // 在 fd 归属的 loop 上注册 epoll 事件
         // targetLoop 可能不是当前线程的 loop，AddEvent 内部已用 RunInLoop 路由
-        targetLoop->AddEvent(clientFd, EPOLL_EVENTS_RW, [targetLoop](int fd, uint32_t event) {
+        // [P2-12 修复] 新连接初始只关心读事件，避免 EPOLLOUT 立即触发空跑 HandleWrite
+        // 业务层调 Send() 时会自动加上 EPOLLOUT
+        targetLoop->AddEvent(clientFd, EPOLL_EVENTS_R, [targetLoop](int fd, uint32_t event) {
             auto pConn = targetLoop->GetConnection(fd);
             if (pConn == nullptr) {
                 std::cout << "HandleAccept pConn null. fd=" << fd << ", event=" << event << std::endl;

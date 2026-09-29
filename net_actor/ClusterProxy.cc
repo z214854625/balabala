@@ -21,6 +21,13 @@ ActorTask ClusterProxy::OnCoroutineMessage(ActorMessage msg)
     if (system_ && msg.sourceId > 0) {
         senderName = system_->GetActorName(msg.sourceId);
     }
+    // [P1-11 修复] senderName 为空时远端无法回程路由，告警提示
+    // （调用方必须通过 RegisterName 注册名字才能被跨进程回复）
+    if (senderName.empty()) {
+        std::cerr << "[ClusterProxy] warning: sender actor " << msg.sourceId
+                  << " has no registered name, remote cannot respond. target="
+                  << remote_.ToString() << std::endl;
+    }
 
     ClusterPacket pkt;
     pkt.sourceNodeId = transport_->GetLocalNodeId();
@@ -170,7 +177,7 @@ std::string ClusterPacketCodec::Encode(const ClusterPacket& pkt)
     return result;
 }
 
-size_t ClusterPacketCodec::Decode(const char* data, size_t len, ClusterPacket& out)
+ssize_t ClusterPacketCodec::Decode(const char* data, size_t len, ClusterPacket& out)
 {
     // 至少需要 4 字节的长度头
     if (len < 4) return 0;
@@ -179,7 +186,13 @@ size_t ClusterPacketCodec::Decode(const char* data, size_t len, ClusterPacket& o
     // 防止恶意超大包（最大 16MB）
     if (bodyLen > 16 * 1024 * 1024) {
         std::cerr << "[ClusterPacketCodec] packet too large: " << bodyLen << std::endl;
-        return 0;
+        return -1;  // [P1-5] 协议错误，上层应断开
+    }
+    // [P1-5 修复] bodyLen 小于最小合法长度 → 协议错误（原实现返回 0 导致永久卡死）
+    if (bodyLen < kMinBodyLen) {
+        std::cerr << "[ClusterPacketCodec] packet body too small: " << bodyLen
+                  << " (min=" << kMinBodyLen << ")" << std::endl;
+        return -1;
     }
 
     // 检查是否有足够数据
@@ -189,17 +202,18 @@ size_t ClusterPacketCodec::Decode(const char* data, size_t len, ClusterPacket& o
     const char* end = data + 4 + bodyLen;
 
     // v2 协议：移除 actorId 字段，添加 sourceActorName
-    if (!ReadStr16(p, end, out.sourceNodeId)) return 0;
-    if (!ReadStr16(p, end, out.targetNodeId)) return 0;
-    if (!ReadStr16(p, end, out.sourceActorName)) return 0;    // v2
-    if (!ReadStr16(p, end, out.targetActorName)) return 0;
-    if (!ReadU32(p, end, out.sessionId)) return 0;
+    // [P1-5] 字段越界返回 -1（原实现返回 0 导致永久卡死）
+    if (!ReadStr16(p, end, out.sourceNodeId)) return -1;
+    if (!ReadStr16(p, end, out.targetNodeId)) return -1;
+    if (!ReadStr16(p, end, out.sourceActorName)) return -1;    // v2
+    if (!ReadStr16(p, end, out.targetActorName)) return -1;
+    if (!ReadU32(p, end, out.sessionId)) return -1;
 
     uint8_t flags = 0;
-    if (!ReadU8(p, end, flags)) return 0;
+    if (!ReadU8(p, end, flags)) return -1;
     out.isResponse = (flags & 1) != 0;
 
-    if (!ReadStr32(p, end, out.data)) return 0;
+    if (!ReadStr32(p, end, out.data)) return -1;
 
     return 4 + bodyLen;
 }
@@ -231,15 +245,24 @@ ActorTask ClusterGatewayActor::OnCoroutineMessage(ActorMessage msg)
         // 循环尝试解码完整数据包
         while (true) {
             ClusterPacket pkt;
-            size_t consumed = ClusterPacketCodec::Decode(buf.data(), buf.size(), pkt);
+            ssize_t consumed = ClusterPacketCodec::Decode(buf.data(), buf.size(), pkt);
             if (consumed == 0) {
                 // 数据不完整，等待更多数据
                 break;
             }
+            if (consumed < 0) {
+                // [P1-6 修复] 协议错误：丢弃缓冲并断开连接，避免永久卡死
+                std::cerr << "[ClusterGateway] protocol error from fd=" << msg.fd
+                          << ", closing connection" << std::endl;
+                recvBuffers_.erase(msg.fd);
+                transport_->OnNodeDisconnected(msg.fd);
+                transport_->GetEventLoop()->RemoveConnection(msg.fd);
+                co_return;
+            }
             // 处理解码后的数据包
             handleDecodedPacket(pkt, msg.fd);
             // 移除已消耗的数据
-            buf.erase(0, consumed);
+            buf.erase(0, static_cast<size_t>(consumed));
         }
         break;
     }
@@ -311,12 +334,20 @@ TcpClusterTransport::TcpClusterTransport(ActorSystem* sys, EventLoop* loop)
 {
     // 创建并注册内部的 ClusterGatewayActor
     auto gateway = std::make_unique<ClusterGatewayActor>(this);
-    gatewayActorId_ = sys_->RegisterActor(std::move(gateway));
+    // 显式转 unique_ptr<Actor>，避免 GCC 11.2 上 RegisterActor 的
+    // unique_ptr/shared_ptr 重载歧义（与 test_actor_lua_state.cc 同一问题）
+    gatewayActorId_ = sys_->RegisterActor(std::unique_ptr<Actor>(std::move(gateway)));
     std::cout << "[TcpClusterTransport] created, gatewayActorId=" << gatewayActorId_ << std::endl;
 }
 
 TcpClusterTransport::~TcpClusterTransport()
 {
+    // [P0-2 修复] 先清理 Connector（需要 EventLoop 仍存活，RemoveConnection 走 QueueInLoop）
+    // 注意：调用方需保证 EventLoop 析构在 TcpClusterTransport 之后，或显式 Stop EventLoop 前
+    //       先析构本对象。否则 Connector 析构中的 RemoveConnection 会访问已销毁的 EventLoop。
+    connectors_.clear();
+    acceptor_.reset();
+
     // 注销 GatewayActor
     if (sys_ && gatewayActorId_ > 0) {
         sys_->UnregisterActor(gatewayActorId_);
@@ -335,8 +366,8 @@ std::string TcpClusterTransport::GetLocalNodeId() const
 
 void TcpClusterTransport::Listen(int port)
 {
-    // 创建 Acceptor，新连接绑定到 ClusterGatewayActor
-    acceptor_ = new Acceptor(port, loop_, gatewayActorId_);
+    // [P0-2 修复] acceptor_ 改为 unique_ptr 管理，避免泄漏
+    acceptor_ = std::make_unique<Acceptor>(port, loop_, gatewayActorId_);
     std::cout << "[TcpClusterTransport] listening on port " << port
               << " (gatewayActorId=" << gatewayActorId_ << ")" << std::endl;
 }
@@ -344,8 +375,9 @@ void TcpClusterTransport::Listen(int port)
 void TcpClusterTransport::ConnectToNode(const std::string& nodeId,
                                          const std::string& ip, int port)
 {
-    // 创建 Connector，连接结果通知给 ClusterGatewayActor
-    auto* connector = new Connector(loop_, port, ip, gatewayActorId_);
+    // [P0-2 修复] Connector 存入 connectors_ 列表，避免泄漏
+    // 连接结果通知给 ClusterGatewayActor
+    auto connector = std::make_unique<Connector>(loop_, port, ip, gatewayActorId_);
     int fd = connector->GetFd();
 
     // 预存 fd → nodeId（Connector 构造时 socket 已创建）
@@ -367,6 +399,8 @@ void TcpClusterTransport::ConnectToNode(const std::string& nodeId,
 
     std::cout << "[TcpClusterTransport] connecting to node=" << nodeId
               << " (" << ip << ":" << port << "), fd=" << fd << std::endl;
+
+    connectors_.push_back(std::move(connector));
 }
 
 bool TcpClusterTransport::SendPacket(const ClusterPacket& packet)
@@ -403,8 +437,17 @@ std::vector<ClusterNode> TcpClusterTransport::GetKnownNodes() const
 
 void TcpClusterTransport::RegisterNodeFd(const std::string& nodeId, int fd)
 {
+    // [P0-3 修复] 处理双向连接场景：A、B 互连时各自 accept+connect 产生两个 fd 指向同一 nodeId。
+    // 原实现直接覆盖 nodeToFd_[nodeId]，导致旧 fd 的映射残留，OnNodeDisconnected 时误擦除。
+    // 改为：若 nodeId 已映射到不同 fd，先清理旧 fd 的 fdToNode_ 条目，再覆盖。
+    int oldFd = -1;
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(connLock_);
+        auto it = nodeToFd_.find(nodeId);
+        if (it != nodeToFd_.end() && it->second != fd) {
+            oldFd = it->second;
+            fdToNode_.erase(oldFd);
+        }
         nodeToFd_[nodeId] = fd;
         fdToNode_[fd] = nodeId;
     }
@@ -426,8 +469,13 @@ void TcpClusterTransport::RegisterNodeFd(const std::string& nodeId, int fd)
         }
     }
 
-    std::cout << "[TcpClusterTransport] node registered: " << nodeId
-              << ", fd=" << fd << std::endl;
+    if (oldFd >= 0) {
+        std::cout << "[TcpClusterTransport] node re-registered: " << nodeId
+                  << ", new fd=" << fd << ", old fd=" << oldFd << " cleared" << std::endl;
+    } else {
+        std::cout << "[TcpClusterTransport] node registered: " << nodeId
+                  << ", fd=" << fd << std::endl;
+    }
 }
 
 int TcpClusterTransport::GetFdByNodeId(const std::string& nodeId)
@@ -464,13 +512,23 @@ std::string TcpClusterTransport::GetNodeIdByFd(int fd)
 void TcpClusterTransport::OnNodeDisconnected(int fd)
 {
     std::string nodeId;
+    bool wasActiveFd = false;
     {
         bllsll::LockGuard<bllsll::SpinLock> lock(connLock_);
         auto it = fdToNode_.find(fd);
         if (it != fdToNode_.end()) {
             nodeId = it->second;
             fdToNode_.erase(it);
-            nodeToFd_.erase(nodeId);
+            // [P0-3 修复] 仅当 nodeToFd_ 指向本 fd 时才擦除
+            // 避免双向连接场景下误擦除另一个活跃 fd 的映射
+            auto nit = nodeToFd_.find(nodeId);
+            if (nit != nodeToFd_.end()) {
+                if (nit->second == fd) {
+                    nodeToFd_.erase(nit);
+                    wasActiveFd = true;
+                }
+                // 否则：nodeId 已映射到另一个 fd（可能是重新连接后的新 fd），保留映射
+            }
         }
     }
     {
@@ -478,7 +536,7 @@ void TcpClusterTransport::OnNodeDisconnected(int fd)
         pendingNodeId_.erase(fd);
     }
 
-    if (!nodeId.empty()) {
+    if (!nodeId.empty() && wasActiveFd) {
         // 更新已知节点状态
         bllsll::LockGuard<bllsll::SpinLock> lock(nodesLock_);
         for (auto& node : knownNodes_) {

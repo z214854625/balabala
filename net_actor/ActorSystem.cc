@@ -333,6 +333,19 @@ void ActorSystem::LinkActor(uint32_t watcherId, uint32_t targetId)
         std::cout << "[ActorSystem::LinkActor] cannot link actor to itself! id=" << watcherId << std::endl;
         return;
     }
+    // [P2-13 修复] 校验 watcher 和 target 都已注册，避免后续向不存在的 watcher 发 ActorDown 噪音
+    // 注意：不持 actorsLock_ 进 linkLock_，避免与 UnregisterActor 的反向加锁顺序死锁
+    {
+        bllsll::LockGuard<bllsll::SpinLock> lock(actorsLock_);
+        if (actors_.find(watcherId) == actors_.end()) {
+            std::cout << "[ActorSystem::LinkActor] watcher not found! id=" << watcherId << std::endl;
+            return;
+        }
+        if (actors_.find(targetId) == actors_.end()) {
+            std::cout << "[ActorSystem::LinkActor] target not found! id=" << targetId << std::endl;
+            return;
+        }
+    }
     bllsll::LockGuard<bllsll::SpinLock> lock(linkLock_);
     linkMap_[targetId].insert(watcherId);
     std::cout << "[ActorSystem::LinkActor] watcher=" << watcherId << " -> target=" << targetId << std::endl;

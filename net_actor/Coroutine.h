@@ -21,6 +21,8 @@
 */
 
 #include <coroutine>
+#include <exception>
+#include <iostream>
 #include "Message.h"
 
 namespace bllsll {
@@ -46,7 +48,19 @@ struct ActorTask
         // 完成后自动销毁协程帧
         std::suspend_never final_suspend() noexcept { return {}; }
         void return_void() {}
-        void unhandled_exception() { std::terminate(); }
+        // [P1-7 修复] 不再 std::terminate，改为捕获并打印异常后吞掉
+        // 原因：协程内部抛异常会直接终止进程，workerLoop 的 try-catch 无法拦截
+        // （异常被协程机制路由到 promise::unhandled_exception，不经过 worker 的 catch）
+        // 改为打印日志后让协程正常结束，避免单条消息异常拖垮整个进程
+        void unhandled_exception() {
+            try {
+                std::rethrow_exception(std::current_exception());
+            } catch (const std::exception& e) {
+                std::cerr << "[Actor] coroutine unhandled exception: " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[Actor] coroutine unknown exception" << std::endl;
+            }
+        }
     };
     // fire-and-forget，不持有 coroutine_handle
     // 协程帧的生命周期由挂起点和 final_suspend 管理

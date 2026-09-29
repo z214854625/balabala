@@ -25,6 +25,8 @@
 #include "../Util/LockGuard.h"
 #include "../Util/SpinLockQueue.h"
 
+#include <type_traits>  // std::is_base_of, std::enable_if_t for RegisterActor template
+
 namespace bllsll {
 
 class EventLoop;
@@ -60,6 +62,16 @@ public:
     uint32_t RegisterActor(std::unique_ptr<Actor> actor);
     // 注册Actor（直接接受 shared_ptr）
     uint32_t RegisterActor(std::shared_ptr<Actor> actor);
+    // 模板版：接受任何派生自 Actor 的 unique_ptr<Derived>
+    // GCC 11.2 上 unique_ptr<Derived> 在两个非模板重载间歧义（同时可转 unique_ptr<Actor>
+    // 与 shared_ptr<Actor>），此模板更特化、无需转换，胜出。
+    // 注：T=Actor 时退化为非模板 unique_ptr<Actor> 重载（非模板更优，无递归）
+    template <typename T,
+              typename = std::enable_if_t<std::is_base_of<Actor, T>::value
+                                          && !std::is_same<T, Actor>::value>>
+    uint32_t RegisterActor(std::unique_ptr<T> actor) {
+        return RegisterActor(std::unique_ptr<Actor>(std::move(actor)));
+    }
     // 注销Actor（会触发 Link 通知，向所有 watcher 发送 ActorDown 消息）
     void UnregisterActor(uint32_t actorId);
     // 发消息给Actor

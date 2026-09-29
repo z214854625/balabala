@@ -19,8 +19,14 @@ Connector::Connector(EventLoop* loop, int port, const std::string& strIp, uint32
 
 Connector::~Connector()
 {
+    // [P1-5 修复] 析构前清理 mapConnRaw_ 中的裸指针映射，避免 fd 复用时
+    // GetConnection 返回悬空指针。socket_ != -1 说明尚未在 HandleWrite 失败路径中清理。
     if (socket_ != -1) {
+        if (loop_) {
+            loop_->RemoveConnection(socket_);
+        }
         close(socket_);
+        socket_ = -1;
     }
 }
 
@@ -52,6 +58,9 @@ void Connector::HandleWrite(int fd, uint32_t events)
             if (actorSys) {
                 actorSys->Send(ownerActorId_, ActorMessage{MsgType::Disconnected, 0, fd, "connect_failed"});
             }
+            // [P1-5 修复] 先 RemoveConnection 清理 mapConnRaw_，再 close fd
+            // 顺序很关键：若先 close，fd 可能被复用，RemoveConnection 会误擦新连接的映射
+            loop_->RemoveConnection(fd);
             loop_->RemoveEvent(fd);
             close(socket_);
             socket_ = -1;

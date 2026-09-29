@@ -82,6 +82,7 @@ namespace bllsll {
 
 class EventLoop;
 class Acceptor;
+class Connector;
 
 // ================================================================
 //  远程 Actor 引用
@@ -149,7 +150,10 @@ public:
     // 尝试从缓冲区解码一个完整数据包
     // 返回值 > 0：消耗的字节数（成功解码）
     // 返回值 == 0：缓冲区不完整，需要更多数据
-    static size_t Decode(const char* data, size_t len, ClusterPacket& out);
+    // 返回值 < 0：协议错误（bodyLen 非法或字段越界），上层应断开连接
+    //   [P1-5 修复] 原实现 bodyLen=0 或 bodyLen < 最小合法长度时返回 0，
+    //   导致调用方永久等待"更多数据"，缓冲区无限增长。
+    static ssize_t Decode(const char* data, size_t len, ClusterPacket& out);
 
 private:
     // 写入辅助
@@ -165,6 +169,9 @@ private:
     static bool ReadU32(const char*& p, const char* end, uint32_t& v);
     static bool ReadStr16(const char*& p, const char* end, std::string& s);
     static bool ReadStr32(const char*& p, const char* end, std::string& s);
+
+    // 合法 body 最小长度：四个 Str16（各 2 字节头）+ U32 sessionId + U8 flags + 空 Str32（4 字节头）
+    static constexpr size_t kMinBodyLen = 2 + 2 + 2 + 2 + 4 + 1 + 4;
 };
 
 // ================================================================
@@ -331,7 +338,10 @@ private:
     EventLoop* loop_;
     std::string localNodeId_;
     uint32_t gatewayActorId_ = 0;
-    Acceptor* acceptor_ = nullptr;
+    // [P0-2 修复] acceptor_ 改为 unique_ptr 管理，析构时自动释放
+    std::unique_ptr<Acceptor> acceptor_;
+    // [P0-2 修复] 存储所有主动连接的 Connector，避免泄漏
+    std::vector<std::unique_ptr<Connector>> connectors_;
 
     // fd ↔ nodeId 双向映射（SpinLock 保护）
     mutable bllsll::SpinLock connLock_;

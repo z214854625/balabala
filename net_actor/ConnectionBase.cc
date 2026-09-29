@@ -77,6 +77,11 @@ void ConnectionBase::Send(const char* pData, int nLen)
     //    → 根据大小选择存储载体：
     //      - 小包（< kBufferThreshold）→ std::string（SSO 友好或单次小 malloc）
     //      - 大包（≥ kBufferThreshold）→ MessageBuffer（make_shared 合并分配）
+    //
+    //  [P0-1 修复] lambda 不再捕获裸 this，改为在 loop 线程内重新 GetConnection
+    //    原因：原实现 [this, fd, ...] 在 task 执行前若 Connection 被 RemoveConnection
+    //    析构，会访问悬空 this → UAF。改为 lambda 捕获 loop_ + fd，执行时重新查表拿
+    //    shared_ptr，Connection 生命周期由 mapConn_ 管理，天然安全。
     // ============================================================
     if (loop_->IsInLoopThread()) {
         sendInLoop(fd, pData, (size_t)nLen);
@@ -86,14 +91,21 @@ void ConnectionBase::Send(const char* pData, int nLen)
     if ((size_t)nLen >= ActorMessage::kBufferThreshold) {
         // 大包：MessageBuffer 路径
         auto buf = MakeBuffer(pData, (size_t)nLen);
-        loop_->RunInLoop([this, fd, buf = std::move(buf)]() mutable {
-            sendInLoop(fd, buf->Data(), buf->Size());
+        EventLoop* loop = loop_;
+        loop_->RunInLoop([loop, fd, buf = std::move(buf)]() mutable {
+            // 重新 GetConnection 拿 shared_ptr，保证执行期间 Connection 不会被析构
+            auto conn = loop->GetConnection(fd);
+            if (!conn) return;  // 连接已断开，丢弃数据
+            conn->Send(buf->Data(), static_cast<int>(buf->Size()));
         });
     } else {
         // 小包：std::string 路径
         std::string data(pData, nLen);
-        loop_->RunInLoop([this, fd, data = std::move(data)]() mutable {
-            sendInLoop(fd, data.data(), data.size());
+        EventLoop* loop = loop_;
+        loop_->RunInLoop([loop, fd, data = std::move(data)]() mutable {
+            auto conn = loop->GetConnection(fd);
+            if (!conn) return;
+            conn->Send(data.data(), static_cast<int>(data.size()));
         });
     }
 }
